@@ -121,11 +121,11 @@ async def handle_events(request: web.Request) -> web.StreamResponse:
 
     # Worker-noise filter is phase-aware. In DM mode (queen phase
     # "independent") the queen's chat should stay clean — workers
-    # are invisible. In colony mode (phase "working"/"reviewing")
-    # the user IS supervising the workers and wants to see the
-    # tool-call/text-delta chatter as it happens. Sample the phase
-    # once at SSE connect; if the queen later transitions the
-    # frontend reconnects.
+    # are invisible. In colony mode (phase "colony") the user IS
+    # supervising the workers and wants to see the tool-call /
+    # text-delta chatter as it happens. Sample the phase once at
+    # SSE connect; if the queen later transitions the frontend
+    # reconnects.
     def _should_filter_worker_noise() -> bool:
         phase_state = getattr(session, "phase_state", None)
         if phase_state is None:

@@ -738,8 +738,8 @@ def test_build_system_prompt_injects_dynamic_memory():
 
 def test_queen_phase_state_appends_global_memory_block():
     phase = QueenPhaseState(
-        phase="working",
-        prompt_working="base prompt",
+        phase="colony",
+        prompt_colony="base prompt",
         _cached_global_recall_block="--- Global Memories ---\nglobal stuff",
     )
 
@@ -751,8 +751,8 @@ def test_queen_phase_state_appends_global_memory_block():
 
 def test_queen_phase_state_appends_queen_memory_block():
     phase = QueenPhaseState(
-        phase="working",
-        prompt_working="base prompt",
+        phase="colony",
+        prompt_colony="base prompt",
         _cached_global_recall_block="--- Global Memories ---\nglobal stuff",
         _cached_queen_recall_block="--- Queen Memories: queen_technology ---\nqueen stuff",
     )
@@ -765,7 +765,7 @@ def test_queen_phase_state_appends_queen_memory_block():
 
 
 def test_queen_phase_state_prompt_without_memory():
-    phase = QueenPhaseState(phase="working", prompt_working="base prompt")
+    phase = QueenPhaseState(phase="colony", prompt_colony="base prompt")
 
     prompt = phase.get_current_prompt()
     assert "base prompt" in prompt

@@ -365,9 +365,9 @@ async def handle_select_queen_session(request: web.Request) -> web.Response:
 
     meta = _read_queen_session_meta(queen_id, target_session_id)
     agent_path = meta.get("agent_path")
-    # Colony resume (agent loaded) → "working" (3-phase target).
+    # Colony resume (agent loaded) → "colony".
     # Standalone queen resume → "independent" (DM mode).
-    initial_phase = "working" if agent_path else "independent"
+    initial_phase = "colony" if agent_path else "independent"
     session = await _create_bound_queen_session(
         manager,
         queen_id,
@@ -385,7 +385,7 @@ async def handle_select_queen_session(request: web.Request) -> web.Response:
 
 async def handle_new_queen_session(request: web.Request) -> web.Response:
     """POST /api/queen/{queen_id}/session/new -- create a fresh queen session."""
-    from framework.tools.queen_lifecycle_tools import QUEEN_PHASES
+    from framework.tools.queen_lifecycle_tools import QUEEN_PHASES, normalize_legacy_phase
 
     queen_id = request.match_info["queen_id"]
     manager = request.app["manager"]
@@ -406,7 +406,7 @@ async def handle_new_queen_session(request: web.Request) -> web.Response:
     else:
         body = {}
     initial_prompt = body.get("initial_prompt")
-    initial_phase = body.get("initial_phase") or "independent"
+    initial_phase = normalize_legacy_phase(body.get("initial_phase")) or "independent"
     if initial_phase not in QUEEN_PHASES:
         return web.json_response(
             {

@@ -1508,7 +1508,7 @@ class AgentHost:
     async def stop_all_workers(self) -> bool:
         """Alias for ``cancel_all_tasks_async`` used by queen-lifecycle tools.
 
-        Queen tools (``stop_worker``, ``switch_to_reviewing``, etc.) call
+        Queen tools (``stop_worker``, etc.) call
         ``runtime.stop_all_workers()`` which is the :class:`ColonyRuntime`
         idiom. In the current architecture the session's runtime is an
         :class:`AgentHost`, which stops workers by cancelling their

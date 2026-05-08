@@ -113,19 +113,40 @@ class WorkerSessionAdapter:
     worker_path: Path | None = None
 
 
-QUEEN_PHASES: frozenset[str] = frozenset({"independent", "incubating", "working", "reviewing"})
+QUEEN_PHASES: frozenset[str] = frozenset({"independent", "incubating", "colony"})
+
+# Legacy phase names from before the WORKING/REVIEWING merge. Read paths
+# (meta.json on disk, request bodies from older clients) normalise these
+# to "colony" via :func:`normalize_legacy_phase`.
+_LEGACY_PHASE_ALIASES: dict[str, str] = {
+    "working": "colony",
+    "reviewing": "colony",
+}
+
+
+def normalize_legacy_phase(phase: str | None) -> str | None:
+    """Translate legacy phase strings to their current equivalents.
+
+    Used on read paths (meta.json, request bodies) so persisted sessions
+    written before the WORKING/REVIEWING merge still load. Pass-through
+    for current names and ``None``.
+    """
+    if phase is None:
+        return None
+    return _LEGACY_PHASE_ALIASES.get(phase, phase)
 
 
 @dataclass
 class QueenPhaseState:
     """Mutable state container for queen operating phase.
 
-    Four phases: independent, incubating, working, reviewing.
+    Three phases: independent, incubating, colony.
     INDEPENDENT: queen acts as a standalone agent with MCP tools, no colony workers.
     INCUBATING: queen has been approved by the incubating_evaluator to fork
         a colony — focused tool surface for drafting the spec.
-    WORKING: colony workers are running autonomously.
-    REVIEWING: workers have completed, queen reviews results.
+    COLONY: the colony has been forked. Workers may be running, finished, or
+        somewhere in between; the queen monitors, intervenes, summarises,
+        and fans out follow-up runs as needed.
 
     Shared between the dynamic_tools_provider callback and tool handlers
     that trigger phase transitions.
@@ -134,8 +155,7 @@ class QueenPhaseState:
     phase: str = "independent"  # one of QUEEN_PHASES
     independent_tools: list = field(default_factory=list)  # list[Tool]
     incubating_tools: list = field(default_factory=list)  # list[Tool]
-    working_tools: list = field(default_factory=list)  # list[Tool]
-    reviewing_tools: list = field(default_factory=list)  # list[Tool]
+    colony_tools: list = field(default_factory=list)  # list[Tool]
     inject_notification: Any = None  # async (str) -> None
     event_bus: Any = None  # EventBus — for emitting QUEEN_PHASE_CHANGED events
 
@@ -145,8 +165,7 @@ class QueenPhaseState:
     # Phase-specific prompts (set by queen_orchestrator after construction)
     prompt_independent: str = ""
     prompt_incubating: str = ""
-    prompt_working: str = ""
-    prompt_reviewing: str = ""
+    prompt_colony: str = ""
 
     # Last-set incubation context, populated by start_incubating_colony when
     # the evaluator approves. Read by get_current_prompt() to interpolate the
@@ -205,22 +224,27 @@ class QueenPhaseState:
     # a byte-stable list between saves and the LLM prompt cache stays warm.
     _filtered_independent_tools: list = field(default_factory=list)
 
-    async def switch_to_working(self, source: str = "tool") -> None:
-        """Switch to working phase — colony workers are running.
+    async def switch_to_colony(self, source: str = "tool") -> None:
+        """Switch to colony phase — the colony has been forked.
+
+        Workers may be live or finished; the colony phase covers both states
+        with a single tool surface and prompt. Replaces the prior
+        ``switch_to_working`` / ``switch_to_reviewing`` split.
 
         Args:
             source: Who triggered the switch — "tool", "frontend", or "auto".
         """
-        if self.phase == "working":
+        if self.phase == "colony":
             return
-        self.phase = "working"
-        tool_names = [t.name for t in self.working_tools]
-        logger.info("Queen phase → working (source=%s, tools: %s)", source, tool_names)
+        self.phase = "colony"
+        tool_names = [t.name for t in self.colony_tools]
+        logger.info("Queen phase → colony (source=%s, tools: %s)", source, tool_names)
         await self._emit_phase_event()
         if self.inject_notification and source != "tool":
             await self.inject_notification(
-                "[PHASE CHANGE] Switched to WORKING phase. "
-                "Colony workers are running. Available tools: " + ", ".join(tool_names) + "."
+                "[PHASE CHANGE] Switched to COLONY phase. "
+                "The colony is live; monitor, intervene, and review as needed. "
+                "Available tools: " + ", ".join(tool_names) + "."
             )
 
     def rebuild_independent_filter(self) -> None:
@@ -263,10 +287,8 @@ class QueenPhaseState:
 
     def get_current_tools(self) -> list:
         """Return tools for the current phase."""
-        if self.phase == "working":
-            return list(self.working_tools)
-        if self.phase == "reviewing":
-            return list(self.reviewing_tools)
+        if self.phase == "colony":
+            return list(self.colony_tools)
         if self.phase == "incubating":
             return list(self.incubating_tools)
         # Default / "independent" — DM mode with full MCP tools, gated by
@@ -292,10 +314,8 @@ class QueenPhaseState:
         ``get_dynamic_suffix()``; the LLM wrapper emits them as two system
         content blocks with a cache breakpoint between them.
         """
-        if self.phase == "working":
-            base = self.prompt_working
-        elif self.phase == "reviewing":
-            base = self.prompt_reviewing
+        if self.phase == "colony":
+            base = self.prompt_colony
         elif self.phase == "incubating":
             # Interpolate the active incubation context so the queen sees the
             # same colony_name on every turn, not just the first tool result.
@@ -383,26 +403,6 @@ class QueenPhaseState:
                     stream_id="queen",
                     data=data,
                 )
-            )
-
-    async def switch_to_reviewing(self, source: str = "tool") -> None:
-        """Switch to reviewing phase — colony workers have finished, queen summarises.
-
-        Args:
-            source: Who triggered the switch — "tool", "frontend", or "auto".
-        """
-        if self.phase == "reviewing":
-            return
-        self.phase = "reviewing"
-        tool_names = [t.name for t in self.reviewing_tools]
-        logger.info("Queen phase → reviewing (source=%s, tools: %s)", source, tool_names)
-        await self._emit_phase_event()
-        if self.inject_notification and source != "tool":
-            await self.inject_notification(
-                "[PHASE CHANGE] Switched to REVIEWING phase. "
-                "Workers have finished. Summarise results, answer follow-ups, "
-                "and help the user decide next steps. "
-                "Available tools: " + ", ".join(tool_names) + "."
             )
 
     async def switch_to_independent(self, source: str = "tool") -> None:
@@ -1437,16 +1437,16 @@ def register_queen_lifecycle_tools(
         except Exception:
             logger.debug("run_parallel_workers: failed to stamp template assignments", exc_info=True)
 
-        # Phase transition — workers are now live, queen is in "working"
-        # phase. Worker-finish auto-transitions back to "reviewing" once
-        # every worker has reported (see queen_orchestrator._on_worker_report).
+        # Phase transition — workers are now live, queen is in "colony"
+        # phase. Colony phase covers both live and finished states, so no
+        # follow-up transition is needed when workers report.
         if phase_state is not None:
             try:
-                await phase_state.switch_to_working()
-                _update_meta_json(session_manager, manager_session_id, {"phase": "working"})
+                await phase_state.switch_to_colony()
+                _update_meta_json(session_manager, manager_session_id, {"phase": "colony"})
             except Exception as exc:
                 logger.warning(
-                    "run_parallel_workers: phase transition to 'working' failed (non-fatal): %s",
+                    "run_parallel_workers: phase transition to 'colony' failed (non-fatal): %s",
                     exc,
                 )
 
@@ -2977,49 +2977,6 @@ def register_queen_lifecycle_tools(
     # and helper above are kept for potential reuse by other code paths or
     # a future per-persona registration gate; today no queen receives it.
     _ = _enqueue_task_tool
-
-    # --- switch_to_reviewing ----------------------------------------------------
-
-    async def switch_to_reviewing_tool() -> str:
-        """Stop the worker and switch to editing phase for config tweaks.
-
-        The worker stays loaded. You can re-run with different input,
-        inject config adjustments, or escalate to building/planning.
-        """
-        stop_result = await stop_worker()
-        result, can_transition = _stop_result_allows_phase_transition(stop_result)
-
-        if phase_state is not None and can_transition:
-            await phase_state.switch_to_reviewing()
-            _update_meta_json(session_manager, manager_session_id, {"phase": "reviewing"})
-
-        if can_transition:
-            result["phase"] = "reviewing"
-            result["message"] = (
-                "Worker stopped. You are now in reviewing phase. "
-                "Review the latest results and decide whether to re-run, "
-                "edit the agent, or move into planning."
-            )
-        else:
-            result["message"] = (
-                "Stop requested, but the worker is still shutting down. Phase will not change until shutdown completes."
-            )
-        return json.dumps(result)
-
-    _switch_editing_tool = Tool(
-        name="switch_to_reviewing",
-        description=(
-            "Stop the running worker and switch to editing phase. "
-            "The worker stays loaded — you can tweak config and re-run. "
-            "Use this when you want to adjust the worker without rebuilding."
-        ),
-        parameters={"type": "object", "properties": {}},
-    )
-    # NOTE: ``switch_to_reviewing`` is intentionally NOT registered as a tool
-    # for the queen. The phase transition is still callable on QueenPhaseState
-    # (and used by routes_execution + queen_orchestrator); the LLM-facing
-    # tool wrapper is dormant.
-    _ = _switch_editing_tool
 
     # --- stop_worker_and_review --------------------------------------------------
 

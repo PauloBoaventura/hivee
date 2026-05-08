@@ -413,12 +413,14 @@ class SessionManager:
         # is incomplete and will fail to import).
         _resume_queen_id: str | None = None
         if queen_resume_from:
+            from framework.tools.queen_lifecycle_tools import normalize_legacy_phase
+
             _resume_phase = None
             _meta_path = _find_queen_session_dir(queen_resume_from) / "meta.json"
             if _meta_path.exists():
                 try:
                     _meta = json.loads(_meta_path.read_text(encoding="utf-8"))
-                    _resume_phase = _meta.get("phase")
+                    _resume_phase = normalize_legacy_phase(_meta.get("phase"))
                     _resume_queen_id = _meta.get("queen_id")
                 except (json.JSONDecodeError, OSError):
                     pass
@@ -1491,10 +1493,12 @@ class SessionManager:
                     if _agent_path and Path(_agent_path).exists():
                         await self.load_colony(session.id, _agent_path)
                         if session.phase_state:
-                            # Restored colony session lands in reviewing — the
-                            # queen summarises whatever the last run produced
-                            # before the user decides what to do next.
-                            await session.phase_state.switch_to_reviewing(source="auto")
+                            # Restored colony session lands in colony phase —
+                            # the merged phase covers both live and finished
+                            # worker states, so the queen can summarise the
+                            # last run AND fan out follow-ups from the same
+                            # tool surface.
+                            await session.phase_state.switch_to_colony(source="auto")
                         logger.info("Cold restore: auto-loaded colony from %s", _agent_path)
                 except Exception:
                     logger.warning("Cold restore: failed to auto-load colony", exc_info=True)

@@ -354,21 +354,18 @@ async def create_queen(
         queen_loop_config as _base_loop_config,
     )
     from framework.agents.queen.nodes import (
+        _QUEEN_COLONY_TOOLS,
         _QUEEN_INCUBATING_TOOLS,
         _QUEEN_INDEPENDENT_TOOLS,
-        _QUEEN_REVIEWING_TOOLS,
-        _QUEEN_WORKING_TOOLS,
         _queen_behavior_always,
         _queen_behavior_independent,
         _queen_character_core,
+        _queen_role_colony,
         _queen_role_incubating,
         _queen_role_independent,
-        _queen_role_reviewing,
-        _queen_role_working,
+        _queen_tools_colony,
         _queen_tools_incubating,
         _queen_tools_independent,
-        _queen_tools_reviewing,
-        _queen_tools_working,
         finalize_queen_prompt,
     )
     from framework.config import get_max_tokens as _get_max_tokens
@@ -464,9 +461,9 @@ async def create_queen(
 
     # ---- Phase state --------------------------------------------------
     # 3-phase model: caller supplies the phase directly (DM → independent,
-    # colony bootstrap → working). Fall back to independent when nothing
+    # colony bootstrap → colony). Fall back to independent when nothing
     # is specified — there is no "staging"/"planning" bootstrap anymore.
-    effective_phase = initial_phase or ("working" if worker_identity else "independent")
+    effective_phase = initial_phase or ("colony" if worker_identity else "independent")
     phase_state = QueenPhaseState(phase=effective_phase, event_bus=session.event_bus)
     session.phase_state = phase_state
 
@@ -541,14 +538,12 @@ async def create_queen(
     # ---- Partition tools by phase ------------------------------------
     independent_names = set(_QUEEN_INDEPENDENT_TOOLS)
     incubating_names = set(_QUEEN_INCUBATING_TOOLS)
-    working_names = set(_QUEEN_WORKING_TOOLS)
-    reviewing_names = set(_QUEEN_REVIEWING_TOOLS)
+    colony_names = set(_QUEEN_COLONY_TOOLS)
 
     registered_names = {t.name for t in queen_tools}
     logger.info("Queen: registered tools: %s", sorted(registered_names))
 
-    phase_state.working_tools = [t for t in queen_tools if t.name in working_names]
-    phase_state.reviewing_tools = [t for t in queen_tools if t.name in reviewing_names]
+    phase_state.colony_tools = [t for t in queen_tools if t.name in colony_names]
     # Incubating tool surface is intentionally minimal (read-only inspection
     # + create_colony + cancel_incubation) — no MCP tools spliced in, so the
     # queen stays focused on drafting the spec.
@@ -556,7 +551,7 @@ async def create_queen(
 
     # Independent phase gets core tools + all MCP tools not claimed by any
     # other phase (files-tools file I/O, gcu-tools browser, etc.).
-    all_phase_names = independent_names | incubating_names | working_names | reviewing_names
+    all_phase_names = independent_names | incubating_names | colony_names
     mcp_tools = [t for t in queen_tools if t.name not in all_phase_names]
     phase_state.independent_tools = [t for t in queen_tools if t.name in independent_names] + mcp_tools
     logger.info(
@@ -566,6 +561,10 @@ async def create_queen(
     logger.info(
         "Queen: incubating tools: %s",
         sorted(t.name for t in phase_state.incubating_tools),
+    )
+    logger.info(
+        "Queen: colony tools: %s",
+        sorted(t.name for t in phase_state.colony_tools),
     )
 
     # ---- Per-queen MCP tool allowlist --------------------------------
@@ -664,12 +663,8 @@ async def create_queen(
         (_queen_character_core + _queen_role_incubating + _queen_tools_incubating + _queen_behavior_always),
         _has_vision,
     )
-    phase_state.prompt_working = finalize_queen_prompt(
-        (_queen_character_core + _queen_role_working + _queen_tools_working + _queen_behavior_always),
-        _has_vision,
-    )
-    phase_state.prompt_reviewing = finalize_queen_prompt(
-        (_queen_character_core + _queen_role_reviewing + _queen_tools_reviewing + _queen_behavior_always),
+    phase_state.prompt_colony = finalize_queen_prompt(
+        (_queen_character_core + _queen_role_colony + _queen_tools_colony + _queen_behavior_always),
         _has_vision,
     )
 
@@ -1069,23 +1064,11 @@ async def create_queen(
                 await agent_loop.inject_event(notification)
                 session.worker_configured = True
 
-                # Only transition to reviewing once the batch has quieted —
-                # if other workers from a parallel spawn are still live, stay
-                # in working so the queen's tool access (run_parallel_workers,
-                # inject_message, stop_worker) remains available.
-                colony_runtime = getattr(session, "colony_runtime", None)
-                still_active = 0
-                if colony_runtime is not None:
-                    try:
-                        still_active = sum(
-                            1
-                            for w in colony_runtime._workers.values()  # type: ignore[attr-defined]
-                            if getattr(w, "is_active", False)
-                        )
-                    except Exception:
-                        still_active = 0
-                if still_active == 0 and phase_state.phase in ("working", "running"):
-                    await phase_state.switch_to_reviewing(source="auto")
+                # No follow-up phase transition needed: the unified colony
+                # phase covers both live and finished states. The queen's
+                # full colony-phase toolkit (run_parallel_workers,
+                # inject_message, stop_worker, set_trigger, etc.) stays
+                # available whether or not workers are still active.
 
             session.event_bus.subscribe(
                 event_types=[EventType.SUBAGENT_REPORT],

@@ -240,16 +240,26 @@ async def test_remove_trigger_cleans_up_webhook_subscription() -> None:
     assert "removable-webhook" not in session.active_webhook_subs
 
 
-def test_run_parallel_workers_in_working_tools() -> None:
-    """run_parallel_workers must be available to the queen in WORKING phase."""
-    from framework.agents.queen.nodes import _QUEEN_WORKING_TOOLS
+def test_run_parallel_workers_in_colony_tools() -> None:
+    """run_parallel_workers must be available to the queen in COLONY phase."""
+    from framework.agents.queen.nodes import _QUEEN_COLONY_TOOLS
 
-    assert "run_parallel_workers" in _QUEEN_WORKING_TOOLS
+    assert "run_parallel_workers" in _QUEEN_COLONY_TOOLS
 
 
-def test_working_tools_include_monitoring() -> None:
-    """WORKING-phase queen must be able to monitor and reply to escalations."""
-    from framework.agents.queen.nodes import _QUEEN_WORKING_TOOLS
+def test_colony_tools_include_monitoring_and_review() -> None:
+    """COLONY-phase queen must be able to monitor live workers AND review finished ones."""
+    from framework.agents.queen.nodes import _QUEEN_COLONY_TOOLS
 
-    for required in ("get_worker_status", "inject_message", "reply_to_worker"):
-        assert required in _QUEEN_WORKING_TOOLS, f"{required} missing from working tools"
+    for required in (
+        # Live-worker controls
+        "get_worker_status",
+        "inject_message",
+        "reply_to_worker",
+        "stop_worker",
+        # Post-run review / scheduling
+        "set_trigger",
+        "remove_trigger",
+        "list_triggers",
+    ):
+        assert required in _QUEEN_COLONY_TOOLS, f"{required} missing from colony tools"

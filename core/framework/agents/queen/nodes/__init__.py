@@ -64,12 +64,17 @@ _QUEEN_INCUBATING_TOOLS = [
     "cancel_incubation",
 ]
 
-# Working phase: colony workers are running. Queen monitors, replies
-# to escalations, and can fan out additional parallel work without
-# leaving this phase.
-_QUEEN_WORKING_TOOLS = [
+# Colony phase: the colony has been forked. Workers may be running,
+# finished, or somewhere in between. Same tool surface either way —
+# the tools themselves are no-ops when their preconditions aren't met
+# (stop_worker on no live workers, etc.). Replaces the previous
+# split between WORKING and REVIEWING phases, which had >75% tool
+# overlap and just produced two near-identical prompts.
+_QUEEN_COLONY_TOOLS = [
     # Read-only
     "read_file",
+    "write_file",
+    "edit_file",
     "search_files",
     # Monitoring + worker dialogue
     "get_worker_status",
@@ -78,44 +83,19 @@ _QUEEN_WORKING_TOOLS = [
     "reply_to_worker",
     # Lifecycle
     "stop_worker",
-    # Fan out more tasks while workers are still running
+    # Fan out more tasks (live or post-run)
     "run_parallel_workers",
-    # Skill authoring: write a colony-scoped skill mid-run so
+    # Skill authoring: write a colony-scoped skill so
     # run_parallel_workers can attach it to spawned workers (DRY:
     # protocol once in a skill, not duplicated across N task strings).
     "write_skill",
-    # Tracker: queen-owned domain DB. tracker_sql is full SQL with
-    # denylist; tracker_register_writable opens a table for worker
-    # writes; tracker_upsert is shared with workers for symmetry but
-    # workers are the typical caller.
-    "tracker_sql",
-    "tracker_register_writable",
-    "tracker_upsert",
-]
-
-# Reviewing phase: workers have finished. Queen summarises results,
-# answers follow-ups, helps the user decide next steps.
-_QUEEN_REVIEWING_TOOLS = [
-    # Read-only
-    "read_file",
-    "search_files",
-    # Status + escalation replies
-    "get_worker_status",
-    "list_worker_questions",
-    "reply_to_worker",
-    # Re-launch a batch if the user asks
-    "run_parallel_workers",
-    # Skill authoring: revising the colony's protocol mid-review
-    # is fair game (e.g. workers reported the schema needs a new
-    # column rule).
-    "write_skill",
-    # Triggers for scheduled follow-up
+    # Triggers for scheduled follow-up runs
     "set_trigger",
     "remove_trigger",
     "list_triggers",
-    # Tracker: same set as WORKING. The queen primarily reads here
-    # (tracker_sql with SELECT) to validate results, but DDL/DML stays
-    # available so she can patch up data she finds wrong while reviewing.
+    # Tracker: queen-owned domain DB. tracker_sql is full SQL with
+    # denylist; tracker_register_writable opens a table for worker
+    # writes; tracker_upsert is shared with workers for symmetry.
     "tracker_sql",
     "tracker_register_writable",
     "tracker_upsert",
@@ -195,25 +175,32 @@ INCUBATING later via ``start_incubating_colony`` when they want to \
 resume the colony spec.
 """
 
-_queen_role_working = """\
-You are in WORKING mode. The colony's spec was settled during \
-INCUBATING; workers are executing that spec now. Your role here is \
-operational presence, not direction — think on-call engineer for a \
-running deployment, not architect of a new one.
+_queen_role_colony = """\
+You are in COLONY mode. The colony's spec was settled during \
+INCUBATING; workers may be running, finished, or somewhere in \
+between. Your role spans both states — operational presence while \
+they run, and post-run review once they're done. Think on-call \
+engineer for a deployment that cycles between active and idle.
 
 What you DO in this phase:
 - Be available for worker escalations (reply_to_worker on items in \
-  list_worker_questions).
-- Surface progress when the user asks for it (get_worker_status), or \
-  when something concrete is worth flagging (a notable failure, a \
-  worker stuck on a question that needs them).
-- Intervene when a worker is clearly off course (inject_message) or \
-  needs to stop (stop_worker).
-- Make SPEC-COMPATIBLE adjustments when the user asks — fan out MORE \
-  of the same work (run_parallel_workers). This is a tweak to the spec \
-  the user already approved, not a redesign. Scheduled / recurring \
-  work belongs to a colony; if the user wants to add or change a \
-  schedule, that's a new colony.
+  list_worker_questions). Live or finished, late questions still \
+  need answers.
+- Surface progress / final results when the user asks \
+  (get_worker_status), or flag something concrete (a notable \
+  failure, a worker stuck on a question that needs them).
+- While workers are LIVE: intervene when one is clearly off course \
+  (inject_message) or needs to stop (stop_worker).
+- After workers FINISH: summarise what they produced, flag what \
+  failed, help the user decide next steps. Read generated files \
+  with read_file when the user asks for specifics. If the user \
+  wants another pass, kick it off with run_parallel_workers; \
+  otherwise stay conversational.
+- Make SPEC-COMPATIBLE adjustments — fan out MORE of the same work \
+  (run_parallel_workers). This is a tweak to the spec the user \
+  already approved, not a redesign. Schedule recurring follow-up \
+  runs of the same colony with set_trigger / list_triggers / \
+  remove_trigger.
 - BEFORE fanning out, factor shared protocol into a skill. If your \
   N task strings would each carry the same schema, output format, \
   tool conventions, or quality bar — stop and call ``write_skill`` \
@@ -227,6 +214,11 @@ What you DO in this phase:
   per-row shape. Workers fill cells via ``tracker_upsert`` and you \
   validate via ``SELECT … WHERE col IS NULL`` — much cheaper than \
   re-reading prose reports to find gaps.
+- If the post-run review itself is multi-step (e.g. "verify each \
+  worker's output, then draft a summary, then propose next steps"), \
+  lay it out upfront with ``task_create_batch`` and walk through \
+  with ``task_update``. Skip the ceremony for a single-paragraph \
+  summary.
 
 What you DO NOT do in this phase:
 - Redesign the colony. If the user asks for something fundamentally \
@@ -236,21 +228,8 @@ What you DO NOT do in this phase:
   in INDEPENDENT via start_incubating_colony, and you cannot reach \
   that from inside a colony.
 - Drive the conversation. Do not poll workers just to have something \
-  to say. If the user greets you mid-run, reply in prose and wait.
-"""
-
-_queen_role_reviewing = """\
-You are in REVIEWING mode. The colony's workers have finished. Your \
-job: summarise what they produced, flag what failed, and help the \
-user decide next steps. Read generated files or worker reports with \
-read_file when the user asks for specifics. If the user wants \
-another pass, kick it off with run_parallel_workers; otherwise stay \
-conversational.
-
-If the review itself is multi-step (e.g. "verify each worker's output, \
-then draft a summary, then propose next steps"), lay it out upfront \
-with `task_create_batch` and walk through with `task_update`. Skip the \
-ceremony for a single-paragraph summary.
+  to say. If the user greets you mid-run or post-run, reply in prose \
+  and wait.
 """
 
 
@@ -384,22 +363,25 @@ the rest.
   start_incubating_colony when they're ready to resume the spec.
 """
 
-_queen_tools_working = """
-# Tools (WORKING mode)
+_queen_tools_colony = """
+# Tools (COLONY mode)
 
-The colony's spec was committed during INCUBATING. Your tools here are \
-operational, not editorial.
+The colony's spec was committed during INCUBATING. Your tools here \
+are operational and review-oriented, not editorial. Same surface \
+whether workers are live or finished — the tools are no-ops when \
+their preconditions aren't met (stop_worker on no live workers, \
+inject_message on a finished worker, etc.).
 
-## Stay informed (only when asked, or when something matters)
-- get_worker_status(focus?) — Pull progress / issues for the user.
-- list_worker_questions() — Check the escalation inbox.
+## Stay informed
+- get_worker_status(focus?) — Pull progress / final reports.
+- list_worker_questions() — Check the escalation inbox (live or leftover).
 
 ## Respond
 - reply_to_worker(request_id, reply) — Answer a worker escalation.
-- inject_message(content) — Course-correct a running worker (e.g. it's \
-  heading the wrong way and the user wants it redirected).
+- inject_message(content) — Course-correct a running worker (only \
+  meaningful while a worker is live).
 
-## Intervene
+## Intervene (live workers)
 - stop_worker() — Kill switch for a runaway or no-longer-needed worker.
 
 ## Spec-compatible adjustments
@@ -415,9 +397,13 @@ operational, not editorial.
   protocol; per-task strings then only need the unique slice (row IDs, \
   URLs, date range). Use when the user wants additional units of an \
   already-defined job, NOT for new scope.
-- Scheduled / recurring work belongs to a colony, not this session. \
-  If the user wants to add or change a schedule, that's a new colony \
-  born from a fresh chat via start_incubating_colony.
+
+## Schedule recurring follow-ups
+- set_trigger / remove_trigger / list_triggers — Schedule recurring \
+  runs of THIS colony (cron / interval / webhook). Use when the user \
+  wants the same colony to fire again on a schedule. Brand-new \
+  scope/schedule for DIFFERENT work is a new colony, not a trigger \
+  on this one.
 
 ## Tracker (queen-owned domain DB)
 - tracker_sql(sql) — Full SQL on the colony's tracker.db. Use to \
@@ -435,10 +421,6 @@ operational, not editorial.
 - read_file, search_files (search_files covers grep/find/ls \
 via target='content' or target='files')
 
-When every worker has reported (success or failure), the phase \
-auto-moves to REVIEWING. You do not need to call a transition tool \
-yourself.
-
 ## What does NOT belong here
 A request like "actually let's also do X" with X being a new scope, \
 new skill, or different problem is a NEW COLONY, not an extension of \
@@ -446,22 +428,6 @@ this one. Tell the user plainly: "this colony is for the work we \
 already started — for that we'd need a fresh chat with me, where I \
 can incubate a new colony." You cannot create a new colony from \
 inside a colony.
-"""
-
-_queen_tools_reviewing = """
-# Tools (REVIEWING mode)
-
-Workers have finished. You have:
-- Read-only: read_file, search_files (search_files = grep+find+ls)
-- get_worker_status(focus?) — Pull the final status / per-worker reports
-- list_worker_questions() / reply_to_worker(request_id, reply) — Answer any \
-late escalations still in the inbox
-- run_parallel_workers(tasks, timeout?) — Start a fresh batch if the user \
-wants another pass (moves the phase back to WORKING)
-- set_trigger / remove_trigger / list_triggers — Schedule follow-ups
-
-Summarise results from worker reports. Read generated files when the user \
-asks for specifics. Do not invent a new pass unless the user asks for one.
 """
 
 
@@ -549,8 +515,8 @@ queen_node = NodeSpec(
     name="Queen",
     description=(
         "User's primary interactive interface. Operates in DM (independent), "
-        "colony-spec drafting (incubating), or colony mode (working / "
-        "reviewing) depending on whether workers have been spawned."
+        "colony-spec drafting (incubating), or colony mode (workers running "
+        "or finished) depending on whether workers have been spawned."
     ),
     node_type="event_loop",
     max_node_visits=0,
@@ -559,7 +525,7 @@ queen_node = NodeSpec(
     nullable_output_keys=[],  # Queen should never have this
     skip_judge=True,  # Queen is a conversational agent; suppress tool-use pressure feedback
     tools=sorted(
-        set(_QUEEN_INDEPENDENT_TOOLS + _QUEEN_INCUBATING_TOOLS + _QUEEN_WORKING_TOOLS + _QUEEN_REVIEWING_TOOLS)
+        set(_QUEEN_INDEPENDENT_TOOLS + _QUEEN_INCUBATING_TOOLS + _QUEEN_COLONY_TOOLS)
     ),
     system_prompt=(
         _queen_character_core
@@ -571,7 +537,7 @@ queen_node = NodeSpec(
 )
 
 ALL_QUEEN_TOOLS = sorted(
-    set(_QUEEN_INDEPENDENT_TOOLS + _QUEEN_INCUBATING_TOOLS + _QUEEN_WORKING_TOOLS + _QUEEN_REVIEWING_TOOLS)
+    set(_QUEEN_INDEPENDENT_TOOLS + _QUEEN_INCUBATING_TOOLS + _QUEEN_COLONY_TOOLS)
 )
 
 __all__ = [
@@ -579,18 +545,15 @@ __all__ = [
     "ALL_QUEEN_TOOLS",
     "_QUEEN_INDEPENDENT_TOOLS",
     "_QUEEN_INCUBATING_TOOLS",
-    "_QUEEN_WORKING_TOOLS",
-    "_QUEEN_REVIEWING_TOOLS",
+    "_QUEEN_COLONY_TOOLS",
     # Character + phase-specific prompt segments (used by queen_orchestrator for dynamic prompts)
     "_queen_character_core",
     "_queen_role_independent",
     "_queen_role_incubating",
-    "_queen_role_working",
-    "_queen_role_reviewing",
+    "_queen_role_colony",
     "_queen_tools_independent",
     "_queen_tools_incubating",
-    "_queen_tools_working",
-    "_queen_tools_reviewing",
+    "_queen_tools_colony",
     "_queen_behavior_always",
     "_queen_behavior_independent",
 ]

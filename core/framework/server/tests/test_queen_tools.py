@@ -69,7 +69,7 @@ class TestPhaseStateFilter:
     def test_filter_isolated_to_independent_phase(self):
         ps = QueenPhaseState(phase="independent")
         ps.independent_tools = [_tool("mcp_a"), _tool("lc_c")]
-        ps.working_tools = [_tool("mcp_a"), _tool("lc_c")]
+        ps.colony_tools = [_tool("mcp_a"), _tool("lc_c")]
         ps.mcp_tool_names_all = {"mcp_a"}
         ps.enabled_mcp_tools = []
         ps.rebuild_independent_filter()
@@ -78,7 +78,7 @@ class TestPhaseStateFilter:
         assert [t.name for t in ps.get_current_tools()] == ["lc_c"]
 
         # Other phases → unaffected
-        ps.phase = "working"
+        ps.phase = "colony"
         assert [t.name for t in ps.get_current_tools()] == ["mcp_a", "lc_c"]
 
     def test_memo_returns_stable_identity_for_prompt_cache(self):

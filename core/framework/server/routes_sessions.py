@@ -123,7 +123,7 @@ async def handle_create_session(request: web.Request) -> web.Response:
     session that can later have a colony loaded via POST /sessions/{id}/colony.
     """
     from framework.agents.queen.queen_profiles import ensure_default_queens, load_queen_profile
-    from framework.tools.queen_lifecycle_tools import QUEEN_PHASES
+    from framework.tools.queen_lifecycle_tools import QUEEN_PHASES, normalize_legacy_phase
 
     manager = _get_manager(request)
     if request.can_read_body:
@@ -142,7 +142,7 @@ async def handle_create_session(request: web.Request) -> web.Response:
     initial_prompt = body.get("initial_prompt")
     queen_resume_from = body.get("queen_resume_from")
     queen_name = body.get("queen_name")
-    initial_phase = body.get("initial_phase")
+    initial_phase = normalize_legacy_phase(body.get("initial_phase"))
     worker_name = body.get("worker_name")
 
     if initial_phase is not None and initial_phase not in QUEEN_PHASES:
