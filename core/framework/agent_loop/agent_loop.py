@@ -639,12 +639,18 @@ class AgentLoop(AgentProtocol):
         tools = list(ctx.available_tools)
         if ctx.supports_direct_user_io:
             tools.append(self._build_ask_user_tool())
-        # Workers (parallel ephemeral agents) get escalate + report_to_parent.
-        # The overseer is client-facing like the queen and has neither.
-        if stream_id not in ("queen", "judge", "overseer"):
+        # Parallel fan-out workers (stream_id="worker:{uuid}") have NO
+        # escalation channel — per BRD they fail-fast via report_to_parent
+        # and the queen re-dispatches with different parameters or takes
+        # over. Escalate stays available to the legacy primary worker
+        # (stream_id="worker", no colon — run_agent_with_input style),
+        # which still uses it for credential / ambiguity handoffs back
+        # to the queen.
+        is_parallel_worker = isinstance(stream_id, str) and stream_id.startswith("worker:")
+        if stream_id not in ("queen", "judge", "overseer") and not is_parallel_worker:
             tools.append(self._build_escalate_tool())
         # Only parallel workers (stream_id="worker:{uuid}") get report_to_parent.
-        if isinstance(stream_id, str) and stream_id.startswith("worker:"):
+        if is_parallel_worker:
             tools.append(build_report_to_parent_tool())
 
         # Hide image-producing tools from text-only models so they never try
@@ -1526,24 +1532,46 @@ class AgentLoop(AgentProtocol):
                 pending_input=None,
             )
 
-            # 6h. Worker auto-escalation on text-only turns
+            # 6h. Worker stall detection on text-only turns
             #
             # Workers that produce text without tool calls or set_output
-            # get a grace period to plan/think, then auto-escalate to the
-            # queen so the worker doesn't spin uselessly.  Sets
-            # queen_input_requested so the existing 6h'' block handles
-            # blocking and resumption.
+            # get a grace period to plan/think, then are auto-failed.
+            # Two paths diverge after grace:
+            #   (a) Parallel workers (stream_id="worker:*"): synthesize
+            #       report_to_parent(status='failed', summary=…) and
+            #       exit cleanly. Per BRD fail-fast model — queen reads
+            #       the failure as a [WORKER_REPORT] and re-dispatches.
+            #       NO escalation event, NO synchronous wait.
+            #   (b) Legacy primary worker (stream_id="worker", no colon):
+            #       fall back to the pre-BRD escalation behavior — emit
+            #       ESCALATION_REQUESTED and pause for queen guidance.
+            #       Kept so existing run_agent_with_input flows that
+            #       depend on credential/ambiguity handoffs don't break.
             _is_worker = (
                 stream_id not in ("queen", "judge")
                 and not False
                 and not ctx.supports_direct_user_io
                 and self._event_bus is not None
             )
+            _is_parallel_worker = isinstance(stream_id, str) and stream_id.startswith("worker:")
             _worker_no_tool_turn = (
                 not real_tool_results and not outputs_set and not queen_input_requested and not user_input_requested
             )
             if _is_worker and _worker_no_tool_turn:
                 _worker_text_only_streak += 1
+                # INFO on each grace turn so observability sees the
+                # streak climbing before any auto-fail fires. Useful
+                # for tuning worker_escalation_grace_turns (if these
+                # land for healthy workers, grace is too tight).
+                logger.info(
+                    "[%s] stall-grace iter=%d streak=%d/%d stream=%s text_preview=%r",
+                    node_id,
+                    iteration,
+                    _worker_text_only_streak,
+                    self._config.worker_escalation_grace_turns,
+                    stream_id,
+                    (assistant_text or "")[:120],
+                )
                 if _worker_text_only_streak <= self._config.worker_escalation_grace_turns:
                     _continue_count += 1
                     if ctx.runtime_logger:
@@ -1554,7 +1582,7 @@ class AgentLoop(AgentProtocol):
                             step_index=iteration,
                             verdict="CONTINUE",
                             verdict_feedback=(
-                                "Worker auto-escalation grace"
+                                "Worker stall grace"
                                 f" ({_worker_text_only_streak}"
                                 f"/{self._config.worker_escalation_grace_turns})"
                             ),
@@ -1565,13 +1593,92 @@ class AgentLoop(AgentProtocol):
                             latency_ms=iter_latency_ms,
                         )
                     continue
-                # Grace exhausted — auto-escalate to queen
-                logger.info(
-                    "[%s] iter=%d: worker text-only streak %d > grace %d, auto-escalating",
+
+                # Grace exhausted.
+                if _is_parallel_worker:
+                    # Path (a): fail-fast via synthetic report_to_parent.
+                    # Build the same payload the LLM would have built,
+                    # run it through the same handler, record on the
+                    # owning Worker, set _report_terminated. The next
+                    # iteration's 6a-pre exits cleanly with success=True
+                    # (the worker terminated cleanly — its REPORT just
+                    # says status='failed').
+                    _preview = (assistant_text or "").strip()
+                    if len(_preview) > 1500:
+                        _preview = _preview[:1500] + "…"
+                    _summary = (
+                        f"Auto-failed: {_worker_text_only_streak} consecutive "
+                        "text-only turns (no tool calls, no set_output, no "
+                        "ask_user). Worker stalled — re-dispatch with "
+                        "different parameters or take over."
+                        + (f" Last text excerpt: {_preview}" if _preview else "")
+                    )
+                    # WARNING: a parallel worker is being terminated for
+                    # stalling. Loud enough to surface in default
+                    # production logs since this is real worker failure
+                    # (the queen will need to re-dispatch).
+                    logger.warning(
+                        "[%s] AUTO-FAIL iter=%d stream=%s exec=%s — parallel worker stalled %d/%d "
+                        "consecutive text-only turns; synthesizing report_to_parent(status='failed') "
+                        "and terminating. text_preview=%r",
+                        node_id,
+                        iteration,
+                        stream_id,
+                        execution_id,
+                        _worker_text_only_streak,
+                        self._config.worker_escalation_grace_turns,
+                        _preview[:240] if _preview else "",
+                    )
+                    _synthetic_input: dict[str, Any] = {
+                        "status": "failed",
+                        "summary": _summary,
+                        "data": {"auto_fail_reason": "stall_text_only"},
+                        "tool_use_id": f"auto_fail_{uuid.uuid4().hex[:12]}",
+                    }
+                    handle_report_to_parent(_synthetic_input)
+                    _normalised = _synthetic_input.get("_normalised", {})
+                    _owner = getattr(self, "_owner_worker", None)
+                    if _owner is not None:
+                        _owner.record_explicit_report(
+                            status=_normalised.get("status", "failed"),
+                            summary=_normalised.get("summary", _summary),
+                            data=_normalised.get("data", {}),
+                        )
+                    self._report_terminated = True
+                    if ctx.runtime_logger:
+                        iter_latency_ms = int((time.time() - iter_start) * 1000)
+                        ctx.runtime_logger.log_step(
+                            node_id=node_id,
+                            node_type="event_loop",
+                            step_index=iteration,
+                            verdict="FAIL",
+                            verdict_feedback=(
+                                f"Auto-failed: stall {_worker_text_only_streak}"
+                                f"/{self._config.worker_escalation_grace_turns}"
+                            ),
+                            tool_calls=logged_tool_calls,
+                            llm_text=assistant_text,
+                            input_tokens=turn_tokens.get("input", 0),
+                            output_tokens=turn_tokens.get("output", 0),
+                            latency_ms=iter_latency_ms,
+                        )
+                    continue
+
+                # Path (b): legacy primary worker — keep escalation.
+                # WARNING for symmetry with the parallel-worker path:
+                # this is a real intervention (worker is being paused
+                # waiting for the queen) and should be visible.
+                logger.warning(
+                    "[%s] AUTO-ESCALATE iter=%d stream=%s exec=%s — legacy worker stalled %d/%d "
+                    "consecutive text-only turns; emitting ESCALATION_REQUESTED and pausing for "
+                    "queen guidance. text_preview=%r",
                     node_id,
                     iteration,
+                    stream_id,
+                    execution_id,
                     _worker_text_only_streak,
                     self._config.worker_escalation_grace_turns,
+                    (assistant_text or "")[:240],
                 )
                 await self._event_bus.emit_escalation_requested(
                     stream_id=stream_id,

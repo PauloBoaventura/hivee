@@ -135,8 +135,21 @@ class LoopConfig:
 
     # Client-facing auto-block grace period.
     cf_grace_turns: int = 1
-    # Worker auto-escalation: text-only turns before escalating to queen.
-    worker_escalation_grace_turns: int = 1
+    # Worker stall grace: consecutive text-only turns (no tool calls,
+    # no set_output, no ask_user) before the framework auto-fails the
+    # worker. Behavior diverges by worker type:
+    #   - Parallel workers (stream_id="worker:*"): synthesize a
+    #     report_to_parent(status='failed') and exit. Per the BRD's
+    #     fail-fast model — queen reads the failure as a
+    #     [WORKER_REPORT] and re-dispatches as needed. NO escalation
+    #     to the queen, NO synchronous wait.
+    #   - Legacy primary worker (stream_id="worker"): emit
+    #     ESCALATION_REQUESTED and pause for queen guidance via
+    #     inject_message. Pre-BRD behavior, retained for legacy flows.
+    # Grace=2 means: first plan-text turn is fine (chain-of-thought),
+    # second consecutive text-only turn is also tolerated (rare-but-OK
+    # for genuinely-thinking models), third triggers the auto-fail.
+    worker_escalation_grace_turns: int = 2
     tool_doom_loop_enabled: bool = True
     # Silent worker: consecutive tool-only turns (no user-facing text)
     # before injecting a nudge to communicate progress.

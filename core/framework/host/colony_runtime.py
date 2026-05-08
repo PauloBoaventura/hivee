@@ -87,6 +87,60 @@ def _env_int(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+# Field whitelist for queen-driven LoopConfig overrides. Limited to the
+# fields a queen has any business tuning per-worker: how long the worker
+# may run (max_iterations), how many tool calls per turn it can fan out
+# (max_tool_calls_per_turn), and how much context to carry before
+# compaction kicks in (max_context_tokens). Everything else on LoopConfig
+# (judge cadence, stall detection, compaction buffer math) stays
+# framework-controlled.
+_ALLOWED_WORKER_LOOP_OVERRIDES = frozenset(
+    {"max_iterations", "max_tool_calls_per_turn", "max_context_tokens"}
+)
+
+# Sanity bounds. Reject pathological values up front rather than letting
+# them blow up mid-run. max_tool_calls_per_turn=0 is permitted (means
+# "unlimited", per LoopConfig default).
+_LOOP_OVERRIDE_BOUNDS = {
+    "max_iterations": (1, 1000),
+    "max_tool_calls_per_turn": (0, 200),
+    "max_context_tokens": (1_000, 1_000_000),
+}
+
+
+def _build_worker_loop_config(overrides: dict[str, Any]) -> Any:
+    """Construct a LoopConfig with queen-supplied overrides applied.
+
+    Imported lazily inside the helper because LoopConfig lives under the
+    agent_loop package and pulling it at module-import time would create
+    a cycle through the colony runtime's own AgentLoop import.
+
+    Unknown keys are silently dropped (we don't want a typo to kill the
+    spawn) but bounds violations raise — those are programmer errors,
+    not data errors.
+    """
+    from framework.agent_loop.agent_loop import LoopConfig
+
+    cfg = LoopConfig()
+    for key, value in (overrides or {}).items():
+        if key not in _ALLOWED_WORKER_LOOP_OVERRIDES:
+            logger.debug(
+                "spawn loop_config_overrides: ignoring unsupported key %r", key
+            )
+            continue
+        if not isinstance(value, int):
+            raise ValueError(
+                f"loop_config override {key!r} must be int, got {type(value).__name__}"
+            )
+        lo, hi = _LOOP_OVERRIDE_BOUNDS[key]
+        if not (lo <= value <= hi):
+            raise ValueError(
+                f"loop_config override {key!r}={value} out of range [{lo}, {hi}]"
+            )
+        setattr(cfg, key, value)
+    return cfg
+
+
 # Laptop-safe default. Each worker is a full AgentLoop (Claude SDK session +
 # tool catalog), so ~4 concurrent is the realistic ceiling on a dev machine.
 # Override via HIVE_MAX_CONCURRENT_WORKERS for servers.
@@ -844,6 +898,7 @@ class ColonyRuntime:
         stream_id: str | None = None,
         profile_name: str | None = None,
         extra_skills: list[str] | None = None,
+        loop_config_overrides: dict[str, Any] | None = None,
     ) -> list[str]:
         """Spawn worker clones and start them in the background.
 
@@ -872,7 +927,7 @@ class ColonyRuntime:
         if not self._running:
             raise RuntimeError("ColonyRuntime is not running")
 
-        from framework.agent_loop.agent_loop import AgentLoop
+        from framework.agent_loop.agent_loop import AgentLoop, LoopConfig
         from framework.host.worker_profiles import get_worker_profile
         from framework.storage.conversation_store import FileConversationStore
 
@@ -1012,10 +1067,21 @@ class ColonyRuntime:
             # AgentLoop takes bus/judge/config/executor at construction;
             # LLM, tools, stream_id, execution_id all come from the
             # AgentContext passed to execute().
+            #
+            # Per-spawn LoopConfig overrides — the queen can dial the
+            # budget for individual workers via ``loop_config_overrides``
+            # (e.g. small cheap workers get max_iterations=10, expensive
+            # research workers get max_iterations=80). Without overrides
+            # we fall through to LoopConfig() defaults so behavior stays
+            # identical to pre-Phase-5.
+            _spawn_loop_config: LoopConfig | None = None
+            if loop_config_overrides:
+                _spawn_loop_config = _build_worker_loop_config(loop_config_overrides)
             agent_loop = AgentLoop(
                 event_bus=self._scoped_event_bus,
                 tool_executor=spawn_executor,
                 conversation_store=worker_conv_store,
+                config=_spawn_loop_config,
             )
 
             # Workers pick up UI-driven override changes via this provider,
@@ -1101,6 +1167,7 @@ class ColonyRuntime:
         tools_override: list[Any] | None = None,
         profile_name: str | None = None,
         skills: list[str] | None = None,
+        loop_config_overrides: dict[str, Any] | None = None,
     ) -> list[str]:
         """Spawn a batch of parallel workers, one per task spec.
 
@@ -1143,6 +1210,16 @@ class ColonyRuntime:
                 _skill_override = list(skills or [])
             else:
                 _skill_override = list(per_task_skills)
+
+            # Per-task budget overrides (max_iterations, max_tool_calls_per_turn,
+            # max_context_tokens). Same fallback semantics as skills: missing
+            # key → batch default; explicit empty {} → "no overrides".
+            _per_task_loop = spec.get("loop_config_overrides")
+            if _per_task_loop is None:
+                _loop_override = dict(loop_config_overrides or {})
+            else:
+                _loop_override = dict(_per_task_loop)
+
             # Per-task profile_name override beats the batch-level default,
             # so a fan-out can mix profiles (e.g. half tasks routed to
             # Slack:work and half to Slack:personal).
@@ -1153,6 +1230,7 @@ class ColonyRuntime:
                 tools=tools_override,
                 profile_name=spec.get("profile_name") or profile_name,
                 extra_skills=_skill_override or None,
+                loop_config_overrides=_loop_override or None,
             )
             worker_ids.extend(ids)
         return worker_ids

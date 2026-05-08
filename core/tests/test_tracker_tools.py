@@ -410,17 +410,121 @@ def test_register_tracker_tools_full_set() -> None:
     reg = ToolRegistry()
     register_tracker_tools(reg)
     names = set(reg.get_tools().keys())
-    assert {"tracker_sql", "tracker_register_writable", "tracker_upsert"}.issubset(names)
+    assert {
+        "tracker_sql",
+        "tracker_register_writable",
+        "tracker_upsert",
+        "tracker_query",
+    }.issubset(names)
 
 
 def test_register_tracker_tools_worker_role_skips_queen_only() -> None:
-    """role='worker' must register only tracker_upsert."""
+    """role='worker' must register tracker_upsert + tracker_query, not the queen-only pair."""
     reg = ToolRegistry()
     register_tracker_tools(reg, role="worker")
     names = set(reg.get_tools().keys())
     assert "tracker_upsert" in names
+    assert "tracker_query" in names  # workers read assignment context
     assert "tracker_sql" not in names
     assert "tracker_register_writable" not in names
+
+
+# ---------------------------------------------------------------------------
+# tracker_query
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tracker_query_select_works(with_ctx: Path) -> None:
+    sql_ex = _executors()["tracker_sql"]
+    q_ex = _executors()["tracker_query"]
+
+    await sql_ex({"sql": "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)"})
+    await sql_ex({"sql": "INSERT INTO t VALUES (1, 'x'), (2, 'y')"})
+
+    r = await q_ex({"sql": "SELECT a, b FROM t ORDER BY a"})
+    assert r["success"] is True
+    assert r["kind"] == "rows"
+    assert r["columns"] == ["a", "b"]
+    assert r["rows"] == [[1, "x"], [2, "y"]]
+
+
+@pytest.mark.asyncio
+async def test_tracker_query_with_cte_allowed(with_ctx: Path) -> None:
+    sql_ex = _executors()["tracker_sql"]
+    q_ex = _executors()["tracker_query"]
+    await sql_ex({"sql": "CREATE TABLE t (a INTEGER)"})
+    await sql_ex({"sql": "INSERT INTO t VALUES (1), (2), (3)"})
+
+    r = await q_ex({"sql": "WITH big AS (SELECT a FROM t WHERE a > 1) SELECT * FROM big"})
+    assert r["success"] is True
+    assert r["rows"] == [[2], [3]]
+
+
+@pytest.mark.asyncio
+async def test_tracker_query_can_introspect_registry(with_ctx: Path) -> None:
+    """Workers can SELECT from _tracker_registry to learn their schema."""
+    sql_ex = _executors()["tracker_sql"]
+    reg_ex = _executors()["tracker_register_writable"]
+    q_ex = _executors()["tracker_query"]
+
+    await sql_ex({"sql": "CREATE TABLE c (k TEXT PRIMARY KEY, v TEXT)"})
+    await reg_ex(
+        {"table": "c", "write_columns": ["v"], "key_columns": ["k"]}
+    )
+    r = await q_ex({"sql": "SELECT table_name, mode FROM _tracker_registry"})
+    assert r["success"] is True
+    assert r["rows"] == [["c", "upsert"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_sql",
+    [
+        "INSERT INTO t VALUES (1)",
+        "UPDATE t SET a=2",
+        "DELETE FROM t",
+        "CREATE TABLE x (a INT)",
+        "DROP TABLE t",
+        "ALTER TABLE t ADD COLUMN c TEXT",
+        "REPLACE INTO t VALUES (1)",
+    ],
+)
+async def test_tracker_query_rejects_writes(with_ctx: Path, bad_sql: str) -> None:
+    r = await _executors()["tracker_query"]({"sql": bad_sql})
+    assert r["success"] is False
+    # Either the SELECT-only check or the underlying denylist fires; both
+    # are acceptable, both should reject.
+    err = r["error"].lower()
+    assert "select-only" in err or "denied" in err or "rejected" in err
+
+
+@pytest.mark.asyncio
+async def test_tracker_query_rejects_multi_statement(with_ctx: Path) -> None:
+    r = await _executors()["tracker_query"](
+        {"sql": "SELECT 1; SELECT 2"}
+    )
+    assert r["success"] is False
+    assert "ONE statement" in r["error"]
+
+
+@pytest.mark.asyncio
+async def test_tracker_query_denylist_still_applies(with_ctx: Path) -> None:
+    """Even though the leading kw is SELECT, ATTACH must be rejected."""
+    # ATTACH is at start so leading-keyword check catches it first.
+    r = await _executors()["tracker_query"]({"sql": "ATTACH DATABASE 'x' AS y"})
+    assert r["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_tracker_query_no_colony_context() -> None:
+    token = _execution_context.set({})
+    try:
+        r = await _executors()["tracker_query"]({"sql": "SELECT 1"})
+        assert r["success"] is False
+        assert "no colony" in r["error"]
+    finally:
+        _execution_context.reset(token)
 
 
 def test_register_tracker_tools_invalid_role() -> None:

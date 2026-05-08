@@ -49,13 +49,21 @@ _WORKER_INHERITED_TOOLS: frozenset[str] = frozenset(
         "terminal_find",
         # Framework synthetics (always available to any AgentLoop node)
         "set_output",
-        "escalate",
-        "ask_user",
-        # Tracker write — workers fill rows in the queen's tracker.db.
-        # The queen-only ``tracker_sql`` and ``tracker_register_writable``
-        # are stripped automatically by _resolve_queen_only_tools because
-        # they're in the queen phase lists but NOT here.
+        # ``report_to_parent`` is the worker's terminal channel: it
+        # publishes a SUBAGENT_REPORT and ends the run. Workers use it
+        # for both success and failure (status='failed' with a clear
+        # reason) — there is no queen-side escalation/reply loop. The
+        # queen reads the failure and either re-dispatches with new
+        # parameters or takes over herself.
+        "report_to_parent",
+        # Tracker reads + writes — workers fill rows in the queen's
+        # tracker.db (tracker_upsert) and read their assignment context
+        # via SELECT (tracker_query). The queen-only ``tracker_sql`` and
+        # ``tracker_register_writable`` are stripped automatically by
+        # _resolve_queen_only_tools because they're in the queen phase
+        # lists but NOT here.
         "tracker_upsert",
+        "tracker_query",
     }
 )
 
@@ -1335,9 +1343,15 @@ async def fork_session_into_colony(
     worker_system_prompt = (
         "You are a focused worker agent spawned by the queen to carry out "
         "one specific task. Read the goal carefully, use your available "
-        "tools to make progress, and call set_output when complete. "
-        "If you get stuck or need human judgement, call escalate to hand "
-        "the question back to the queen.\n\n"
+        "tools to make progress, and call set_output when complete.\n\n"
+        "FAIL FAST. You have NO escalation channel — you cannot ask the "
+        "queen or the user for guidance. If you can't complete the task "
+        "(missing info, blocked, repeated tool failure, scope ambiguity), "
+        "call ``report_to_parent(status='failed', summary=<one-paragraph "
+        "reason>, data=<any partial state>)`` and stop. The queen reads "
+        "the failure and either re-dispatches you with different "
+        "parameters or takes over. Do NOT loop trying alternative "
+        "workarounds for >2-3 attempts; surface the failure cleanly.\n\n"
         f"Task: {worker_task}"
     )
 

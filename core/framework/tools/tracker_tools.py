@@ -460,6 +460,117 @@ def _tracker_upsert_schema() -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# tracker_query (shared — SELECT-only)
+# ---------------------------------------------------------------------------
+
+
+_TRACKER_QUERY_DESC = (
+    "Read rows from the colony's tracker.db. SELECT-only — DDL, INSERT, "
+    "UPDATE, and DELETE are rejected (use tracker_upsert for writes).\n\n"
+    "Workers: use this to read your assignment context (e.g. \"which "
+    "rows still need work\", \"what columns are expected\") instead of "
+    "asking the queen. The queen has already designed the table; you "
+    "can introspect via SELECT against ``sqlite_master`` or the table "
+    "directly.\n\n"
+    "Queen: also fine to use for read-only checks; tracker_sql covers "
+    "the same ground with broader powers.\n\n"
+    "Returns ``{kind: 'rows', columns: [...], rows: [[...], ...], "
+    "rowcount, truncated}``. Rows past row_cap are dropped (truncated="
+    "true); paginate with LIMIT/OFFSET.\n\n"
+    "Allowed: SELECT, WITH, EXPLAIN. Forbidden: ATTACH, DETACH, PRAGMA, "
+    "VACUUM, REINDEX, load_extension(), and ALL writes/DDL."
+)
+
+
+def _tracker_query_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "sql": {
+                "type": "string",
+                "description": (
+                    "SELECT (or WITH … SELECT) statement. Single statement; "
+                    "scripts not allowed."
+                ),
+            },
+            "row_cap": {
+                "type": "integer",
+                "description": "Max rows returned (default 1000).",
+                "minimum": 1,
+                "maximum": 10000,
+            },
+        },
+        "required": ["sql"],
+    }
+
+
+# Statement keywords that count as "read" — anything else is rejected.
+_READ_KEYWORDS = frozenset({"SELECT", "WITH", "EXPLAIN"})
+
+
+def _make_tracker_query_executor():
+    async def execute(inputs: dict) -> dict[str, Any]:
+        from framework.host.tracker_db import (
+            _split_statements,
+            _leading_keyword,
+        )
+
+        db_path = _resolve_tracker_db_path()
+        if db_path is None:
+            return {
+                "success": False,
+                "error": "tracker_query: no colony context.",
+            }
+        sql = inputs.get("sql")
+        if not isinstance(sql, str) or not sql.strip():
+            return {"success": False, "error": "tracker_query: 'sql' is required."}
+
+        # Reject anything that isn't a pure read. Multi-statement scripts
+        # are also rejected — the worker should issue one SELECT per call
+        # so write-attempts disguised in a script can't slip through.
+        statements = _split_statements(sql)
+        if not statements:
+            return {"success": False, "error": "tracker_query: no statements"}
+        if len(statements) > 1:
+            return {
+                "success": False,
+                "error": (
+                    "tracker_query accepts ONE statement per call (got "
+                    f"{len(statements)}). Use tracker_sql for scripts."
+                ),
+            }
+        kw = _leading_keyword(statements[0])
+        if kw not in _READ_KEYWORDS:
+            return {
+                "success": False,
+                "error": (
+                    f"tracker_query is SELECT-only; rejected leading "
+                    f"keyword '{kw}'. For writes, use tracker_upsert."
+                ),
+            }
+
+        # The denylist (ATTACH/PRAGMA/load_extension/etc.) still applies
+        # via execute_sql → validate_sql. The leading-keyword check above
+        # is stricter than validate_sql (which permits write DML); the
+        # denylist sits underneath as belt-and-suspenders.
+        row_cap = int(inputs.get("row_cap") or 1000)
+        try:
+            result = execute_sql(db_path, sql, row_cap=row_cap)
+        except DenylistError as e:
+            return {"success": False, "error": f"tracker_query denied: {e}"}
+        except sqlite3.Error as e:
+            return {"success": False, "error": f"tracker_query sqlite error: {e}"}
+        return {"success": True, **result}
+
+    return execute
+
+
+# ---------------------------------------------------------------------------
+# tracker_upsert (worker-facing)
+# ---------------------------------------------------------------------------
+
+
 def _make_tracker_upsert_executor():
     async def execute(inputs: dict) -> dict[str, Any]:
         from framework.host.tracker_db import _connect
@@ -610,7 +721,7 @@ QUEEN_ONLY_TRACKER_TOOLS: frozenset[str] = frozenset(
 
 
 def build_tracker_tools() -> list[tuple[Tool, Any]]:
-    """Build (Tool, executor) pairs for the three tracker tools."""
+    """Build (Tool, executor) pairs for the four tracker tools."""
     return [
         (
             Tool(
@@ -638,6 +749,15 @@ def build_tracker_tools() -> list[tuple[Tool, Any]]:
                 concurrency_safe=False,
             ),
             _make_tracker_upsert_executor(),
+        ),
+        (
+            Tool(
+                name="tracker_query",
+                description=_TRACKER_QUERY_DESC,
+                parameters=_tracker_query_schema(),
+                concurrency_safe=True,
+            ),
+            _make_tracker_query_executor(),
         ),
     ]
 

@@ -1090,6 +1090,9 @@ def register_queen_lifecycle_tools(
         timeout: float | None = None,
         hard_timeout: float | None = None,
         skills: list[str] | None = None,
+        max_iterations: int | None = None,
+        max_tool_calls_per_turn: int | None = None,
+        max_context_tokens: int | None = None,
     ) -> str:
         """Spawn N parallel workers and return immediately.
 
@@ -1352,6 +1355,16 @@ def register_queen_lifecycle_tools(
                 entry["skills"] = [str(s) for s in per_task_skills if s]
             if spec.get("profile_name"):
                 entry["profile_name"] = str(spec["profile_name"])
+            # Per-task budget overrides. Each is optional; only fields
+            # the queen explicitly set on this spec land in the dict —
+            # missing fields fall back to the batch default at
+            # spawn_batch time.
+            per_task_loop: dict[str, Any] = {}
+            for _key in ("max_iterations", "max_tool_calls_per_turn", "max_context_tokens"):
+                if _key in spec and isinstance(spec[_key], int):
+                    per_task_loop[_key] = spec[_key]
+            if per_task_loop:
+                entry["loop_config_overrides"] = per_task_loop
             normalised.append(entry)
 
         if _colony_db_path:
@@ -1401,11 +1414,22 @@ def register_queen_lifecycle_tools(
                 exc_info=True,
             )
 
+        # Batch-level budget overrides: only include fields the queen
+        # explicitly passed (None = leave the framework default alone).
+        batch_loop_overrides: dict[str, Any] = {}
+        if isinstance(max_iterations, int):
+            batch_loop_overrides["max_iterations"] = max_iterations
+        if isinstance(max_tool_calls_per_turn, int):
+            batch_loop_overrides["max_tool_calls_per_turn"] = max_tool_calls_per_turn
+        if isinstance(max_context_tokens, int):
+            batch_loop_overrides["max_context_tokens"] = max_context_tokens
+
         try:
             worker_ids = await colony.spawn_batch(
                 normalised,
                 tools_override=tools_override_parallel,
                 skills=list(skills or []) or None,
+                loop_config_overrides=batch_loop_overrides or None,
             )
         except Exception as e:
             return json.dumps({"error": f"spawn_batch failed: {e}"})
@@ -1561,6 +1585,34 @@ def register_queen_lifecycle_tools(
                                     "Per-task skill attachment (overrides batch 'skills')."
                                 ),
                             },
+                            "max_iterations": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 1000,
+                                "description": (
+                                    "Per-task cap on the worker's AgentLoop "
+                                    "iterations. Overrides batch-level "
+                                    "max_iterations for this task."
+                                ),
+                            },
+                            "max_tool_calls_per_turn": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 200,
+                                "description": (
+                                    "Per-task cap on tool calls per assistant "
+                                    "turn (0 = unlimited). Overrides batch."
+                                ),
+                            },
+                            "max_context_tokens": {
+                                "type": "integer",
+                                "minimum": 1000,
+                                "maximum": 1000000,
+                                "description": (
+                                    "Per-task context window before compaction. "
+                                    "Overrides batch."
+                                ),
+                            },
                         },
                         "required": ["task"],
                     },
@@ -1579,6 +1631,34 @@ def register_queen_lifecycle_tools(
                         "via write_skill, then reference it here. "
                         "Per-task 'skills' on a task spec OVERRIDES this "
                         "for that one task."
+                    ),
+                },
+                "max_iterations": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "description": (
+                        "Batch-level cap on each worker's AgentLoop iterations. "
+                        "Per-task value overrides this. Default: framework "
+                        "default (50)."
+                    ),
+                },
+                "max_tool_calls_per_turn": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 200,
+                    "description": (
+                        "Batch-level cap on tool calls per assistant turn. "
+                        "0 = unlimited. Per-task value overrides this."
+                    ),
+                },
+                "max_context_tokens": {
+                    "type": "integer",
+                    "minimum": 1000,
+                    "maximum": 1000000,
+                    "description": (
+                        "Batch-level context window before compaction. "
+                        "Per-task value overrides this."
                     ),
                 },
                 "timeout": {

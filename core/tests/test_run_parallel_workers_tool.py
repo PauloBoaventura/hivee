@@ -309,7 +309,7 @@ async def test_run_parallel_workers_workers_inherit_only_queens_tools(
         # AgentLoops.
         captured: dict = {}
 
-        async def _capturing_spawn_batch(tasks, *, tools_override=None, profile_name=None, skills=None):
+        async def _capturing_spawn_batch(tasks, *, tools_override=None, profile_name=None, skills=None, loop_config_overrides=None):
             captured["tools_override"] = tools_override
             captured["task_count"] = len(tasks)
             return [f"w_{i}" for i in range(len(tasks))]
@@ -393,7 +393,7 @@ async def test_run_parallel_workers_threads_skills_to_spawn_batch(
     try:
         captured: dict = {}
 
-        async def _capturing_spawn_batch(tasks, *, tools_override=None, profile_name=None, skills=None):
+        async def _capturing_spawn_batch(tasks, *, tools_override=None, profile_name=None, skills=None, loop_config_overrides=None):
             captured["batch_skills"] = skills
             captured["task_skills"] = [t.get("skills") for t in tasks]
             captured["task_count"] = len(tasks)
@@ -492,6 +492,253 @@ async def test_spawn_batch_per_task_skills_overrides_batch_default(
         # Empty list explicitly passed: spawn gets None (no skills).
         assert captured[1]["extra_skills"] is None
         assert captured[2]["extra_skills"] == ["x", "y"]
+    finally:
+        await colony.stop()
+
+
+@pytest.mark.asyncio
+async def test_run_parallel_workers_threads_budget_overrides_to_spawn_batch(
+    tmp_path: Path,
+) -> None:
+    """Per-task and batch-level budget overrides must reach spawn_batch
+    in the right shape, and per-task overrides must win for that task."""
+    from types import SimpleNamespace
+
+    bus = EventBus()
+    colony = ColonyRuntime(
+        agent_spec=AgentSpec(
+            id="t",
+            name="t",
+            description="t",
+            system_prompt="t",
+            agent_type="event_loop",
+        ),
+        goal=Goal(id="g", name="g", description="g"),
+        storage_path=tmp_path / "colony",
+        llm=_ByTaskMockLLM({}),
+        tools=[],
+        tool_executor=_stub_executor,
+        event_bus=bus,
+        colony_id="budget_test",
+        pipeline_stages=[],
+    )
+    await colony.start()
+    try:
+        captured: dict = {}
+
+        async def _capturing_spawn_batch(
+            tasks,
+            *,
+            tools_override=None,
+            profile_name=None,
+            skills=None,
+            loop_config_overrides=None,
+        ):
+            captured["batch_loop"] = loop_config_overrides
+            captured["task_loops"] = [t.get("loop_config_overrides") for t in tasks]
+            return [f"w_{i}" for i in range(len(tasks))]
+
+        colony.spawn_batch = _capturing_spawn_batch  # type: ignore[assignment]
+
+        session = _FakeSession(colony, "budget_test")
+        session.queen_executor = SimpleNamespace(  # type: ignore[attr-defined]
+            node_registry={"queen": SimpleNamespace(_last_ctx=None)}
+        )
+        registry = ToolRegistry()
+        register_queen_lifecycle_tools(registry, session=session, session_id=session.id)
+        executor = registry.get_executor()
+
+        result = executor(
+            ToolUse(
+                id="tu",
+                name="run_parallel_workers",
+                input={
+                    "tasks": [
+                        {"task": "a"},  # batch defaults apply
+                        {
+                            "task": "b",
+                            "max_iterations": 10,
+                            "max_context_tokens": 16000,
+                        },  # per-task override
+                    ],
+                    "max_iterations": 50,
+                    "max_tool_calls_per_turn": 30,
+                },
+            )
+        )
+        if asyncio.iscoroutine(result):
+            result = await result
+
+        assert not result.is_error, result.content
+        # Batch-level forwarded.
+        assert captured["batch_loop"] == {
+            "max_iterations": 50,
+            "max_tool_calls_per_turn": 30,
+        }
+        # Task 0: no per-task override.
+        assert captured["task_loops"][0] is None
+        # Task 1: only the fields she set are there; spawn_batch will
+        # fall back to batch for the missing one.
+        assert captured["task_loops"][1] == {
+            "max_iterations": 10,
+            "max_context_tokens": 16000,
+        }
+    finally:
+        await colony.stop()
+
+
+@pytest.mark.asyncio
+async def test_spawn_batch_per_task_loop_overrides_supersede_batch(
+    tmp_path: Path,
+) -> None:
+    """Direct dispatcher test: per-task loop_config_overrides replace the
+    batch default for that one worker; missing per-task config falls
+    back to the batch."""
+    bus = EventBus()
+    colony = ColonyRuntime(
+        agent_spec=AgentSpec(id="t", name="t", description="t", system_prompt="t", agent_type="event_loop"),
+        goal=Goal(id="g", name="g", description="g"),
+        storage_path=tmp_path / "colony",
+        llm=_ByTaskMockLLM({}),
+        tools=[],
+        tool_executor=_stub_executor,
+        event_bus=bus,
+        colony_id="dispatch_loop_test",
+        pipeline_stages=[],
+    )
+    await colony.start()
+    try:
+        seen: list[dict | None] = []
+
+        async def _capturing_spawn(*args, **kwargs):
+            seen.append(kwargs.get("loop_config_overrides"))
+            return ["w"]
+
+        colony.spawn = _capturing_spawn  # type: ignore[assignment]
+
+        await colony.spawn_batch(
+            [
+                {"task": "uses-batch"},
+                {"task": "overrides", "loop_config_overrides": {"max_iterations": 5}},
+            ],
+            loop_config_overrides={"max_iterations": 100, "max_context_tokens": 64000},
+        )
+
+        # Task 0 uses the batch default verbatim.
+        assert seen[0] == {"max_iterations": 100, "max_context_tokens": 64000}
+        # Task 1 fully replaces with its own dict (max_context_tokens is
+        # NOT inherited — per-task is opt-in atomic).
+        assert seen[1] == {"max_iterations": 5}
+    finally:
+        await colony.stop()
+
+
+class _AlwaysTextOnlyLLM(LLMProvider):
+    """Mock LLM that NEVER calls tools — every turn is text-only.
+
+    Used to exercise the worker stall detector: with grace=2 a parallel
+    worker should auto-fail (synthesizing report_to_parent(status='failed'))
+    on the third consecutive text-only turn.
+    """
+
+    model: str = "mock-text-only"
+
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        system: str = "",
+        tools: list[Tool] | None = None,
+        max_tokens: int = 4096,
+        **kwargs,
+    ) -> AsyncIterator:
+        yield TextDeltaEvent(content="Hmm, let me think...", snapshot="Hmm, let me think...")
+        yield FinishEvent(stop_reason="stop", input_tokens=10, output_tokens=5, model="mock")
+
+    def complete(self, messages, system="", **kwargs) -> LLMResponse:
+        return LLMResponse(content="", model="mock", stop_reason="stop")
+
+
+@pytest.mark.asyncio
+async def test_parallel_worker_stall_auto_fails_with_synthetic_report(
+    tmp_path: Path,
+) -> None:
+    """A parallel worker that produces text-only turns past grace must
+    auto-fail via a synthesized report_to_parent(status='failed') —
+    NOT by emitting ESCALATION_REQUESTED. Per BRD fail-fast model.
+
+    This locks in: (a) no ESCALATION_REQUESTED fires for parallel
+    workers; (b) SUBAGENT_REPORT fires with status='failed' and a
+    summary containing the auto-fail reason; (c) worker terminates
+    cleanly (no synchronous queen-input wait).
+    """
+    bus = EventBus()
+    colony = ColonyRuntime(
+        agent_spec=AgentSpec(
+            id="stall_test",
+            name="Stall Test Colony",
+            description="Mock colony for stall detection tests.",
+            system_prompt="You are a worker.",
+            agent_type="event_loop",
+            output_keys=[],
+            tool_access_policy="all",
+        ),
+        goal=Goal(id="g", name="g", description="g"),
+        storage_path=tmp_path / "colony",
+        llm=_AlwaysTextOnlyLLM(),
+        tools=[],
+        tool_executor=_stub_executor,
+        event_bus=bus,
+        colony_id="stall_test",
+        pipeline_stages=[],
+    )
+    await colony.start()
+
+    # Capture both event types so we can assert what fired and what didn't.
+    reports: list[dict] = []
+    escalations: list[dict] = []
+
+    async def _on_report(event: AgentEvent) -> None:
+        reports.append(event.data or {})
+
+    async def _on_escalation(event: AgentEvent) -> None:
+        escalations.append(event.data or {})
+
+    bus.subscribe(event_types=[EventType.SUBAGENT_REPORT], handler=_on_report)
+    bus.subscribe(event_types=[EventType.ESCALATION_REQUESTED], handler=_on_escalation)
+
+    try:
+        # Spawn directly (bypasses run_parallel_workers tool, which would
+        # also work but adds a layer of session/registry mocking we don't
+        # need for this assertion).
+        worker_ids = await colony.spawn_batch(
+            [{"task": "do something"}],
+        )
+        assert len(worker_ids) == 1
+
+        # Wait for the auto-fail report. With grace=2 the worker fails
+        # on the 3rd text-only turn; each turn is a no-op LLM call so
+        # the whole sequence should land in well under 5s.
+        for _ in range(50):
+            if reports:
+                break
+            await asyncio.sleep(0.1)
+
+        assert len(reports) == 1, (
+            f"expected one SUBAGENT_REPORT, got {len(reports)}: {reports}"
+        )
+        report = reports[0]
+        assert report.get("status") == "failed"
+        # Summary must explain WHY (so the queen can re-dispatch
+        # informedly) and include the auto-fail signature.
+        assert "auto-failed" in report.get("summary", "").lower() or \
+            "stall" in report.get("summary", "").lower()
+        # Critical BRD invariant: parallel workers MUST NOT emit
+        # ESCALATION_REQUESTED. They fail-fast or report success;
+        # there is no escalation channel.
+        assert escalations == [], (
+            f"Parallel worker fired ESCALATION_REQUESTED — should be "
+            f"impossible after BRD escalation removal. Got: {escalations}"
+        )
     finally:
         await colony.stop()
 
