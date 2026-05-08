@@ -80,6 +80,10 @@ _QUEEN_WORKING_TOOLS = [
     "stop_worker",
     # Fan out more tasks while workers are still running
     "run_parallel_workers",
+    # Skill authoring: write a colony-scoped skill mid-run so
+    # run_parallel_workers can attach it to spawned workers (DRY:
+    # protocol once in a skill, not duplicated across N task strings).
+    "write_skill",
     # Tracker: queen-owned domain DB. tracker_sql is full SQL with
     # denylist; tracker_register_writable opens a table for worker
     # writes; tracker_upsert is shared with workers for symmetry but
@@ -101,6 +105,10 @@ _QUEEN_REVIEWING_TOOLS = [
     "reply_to_worker",
     # Re-launch a batch if the user asks
     "run_parallel_workers",
+    # Skill authoring: revising the colony's protocol mid-review
+    # is fair game (e.g. workers reported the schema needs a new
+    # column rule).
+    "write_skill",
     # Triggers for scheduled follow-up
     "set_trigger",
     "remove_trigger",
@@ -206,6 +214,19 @@ What you DO in this phase:
   the user already approved, not a redesign. Scheduled / recurring \
   work belongs to a colony; if the user wants to add or change a \
   schedule, that's a new colony.
+- BEFORE fanning out, factor shared protocol into a skill. If your \
+  N task strings would each carry the same schema, output format, \
+  tool conventions, or quality bar — stop and call ``write_skill`` \
+  ONCE with that common ground, then pass ``skills=['<name>']`` to \
+  ``run_parallel_workers``. Each task string then carries only the \
+  per-worker DIFFERENCES (which row IDs, which URLs, which date \
+  range). Don't burn N×600 tokens repeating yourself — workers see \
+  the skill body in their system prompt from turn 0.
+- Use the tracker (``tracker_sql`` to design + ``tracker_register_writable`` \
+  to open columns for worker writes) when the goal has a clear \
+  per-row shape. Workers fill cells via ``tracker_upsert`` and you \
+  validate via ``SELECT … WHERE col IS NULL`` — much cheaper than \
+  re-reading prose reports to find gaps.
 
 What you DO NOT do in this phase:
 - Redesign the colony. If the user asks for something fundamentally \
@@ -382,12 +403,33 @@ operational, not editorial.
 - stop_worker() — Kill switch for a runaway or no-longer-needed worker.
 
 ## Spec-compatible adjustments
-- run_parallel_workers(tasks, timeout?) — Fan out MORE of the same \
-  work. Use when the user wants additional units of an already-defined \
-  job, NOT for new scope. Each task string must be fully self-contained.
+- write_skill(skill_name, skill_description, skill_body) — Author or \
+  replace a colony-scoped skill. Call this BEFORE run_parallel_workers \
+  whenever the per-task protocol would otherwise be duplicated across \
+  task strings (schema, output format, tool conventions, quality bar). \
+  The skill goes into the worker's system prompt from turn 0; the task \
+  string then carries only per-worker differences. Common shared \
+  protocol → ONE skill, not N copies of the same prose.
+- run_parallel_workers(tasks, skills?, timeout?) — Fan out MORE of the \
+  same work. Pass ``skills=['<your-skill>']`` to attach a shared \
+  protocol; per-task strings then only need the unique slice (row IDs, \
+  URLs, date range). Use when the user wants additional units of an \
+  already-defined job, NOT for new scope.
 - Scheduled / recurring work belongs to a colony, not this session. \
   If the user wants to add or change a schedule, that's a new colony \
   born from a fresh chat via start_incubating_colony.
+
+## Tracker (queen-owned domain DB)
+- tracker_sql(sql) — Full SQL on the colony's tracker.db. Use to \
+  CREATE TABLE for the goal's row shape (one row = one tracked unit), \
+  seed primary keys you already know, and validate worker output \
+  (SELECT … WHERE col IS NULL → re-dispatch the gaps).
+- tracker_register_writable(table, write_columns, key_columns) — \
+  Open columns to worker writes. Workers can only call tracker_upsert \
+  on registered tables; without this they're locked out.
+- tracker_upsert(table, row) — Shared with workers. Call directly \
+  yourself only for one-off fixes; the typical path is workers writing \
+  rows you validate via tracker_sql.
 
 ## Read-only inspection
 - read_file, search_files (search_files covers grep/find/ls \

@@ -843,6 +843,7 @@ class ColonyRuntime:
         tool_executor: Callable | None = None,
         stream_id: str | None = None,
         profile_name: str | None = None,
+        extra_skills: list[str] | None = None,
     ) -> list[str]:
         """Spawn worker clones and start them in the background.
 
@@ -923,15 +924,26 @@ class ColonyRuntime:
         except Exception:
             logger.debug("Spawn-time MCP credential filter failed", exc_info=True)
 
-        # Colony progress tracker: when the caller supplied a db_path
-        # in input_data, this worker is part of a SQLite task queue
-        # and must see the hive.colony-progress-tracker skill body in
-        # its system prompt from turn 0. Rebuild the catalog with the
-        # skill pre-activated; falls back to the colony default when
-        # no db_path is present.
+        # Colony progress tracker + per-spawn extra skills: build the
+        # active skill list for THIS worker. The colony-progress-tracker
+        # is auto-activated when a progress.db exists (workers need it
+        # to claim/update queue rows). ``extra_skills`` is the queen's
+        # explicit attachment via run_parallel_workers — used to factor
+        # shared protocol out of the per-task prose into a skill the
+        # worker reads once.
         _spawn_catalog = self.skills_catalog_prompt
         _spawn_skill_dirs = self.skill_dirs
+        _active_skills: list[str] = []
         if isinstance(input_data, dict) and input_data.get("db_path"):
+            _active_skills.append("hive.colony-progress-tracker")
+        if extra_skills:
+            # De-dupe while preserving order so the prompt is stable.
+            seen = set(_active_skills)
+            for name in extra_skills:
+                if name and name not in seen:
+                    _active_skills.append(name)
+                    seen.add(name)
+        if _active_skills:
             try:
                 from framework.skills.config import SkillsConfig
                 from framework.skills.manager import SkillsManager, SkillsManagerConfig
@@ -939,7 +951,7 @@ class ColonyRuntime:
                 _pre = SkillsManager(
                     SkillsManagerConfig(
                         skills_config=SkillsConfig.from_agent_vars(
-                            skills=["hive.colony-progress-tracker"],
+                            skills=_active_skills,
                         ),
                     )
                 )
@@ -949,15 +961,16 @@ class ColonyRuntime:
                     list(_pre.allowlisted_dirs) if hasattr(_pre, "allowlisted_dirs") else self.skill_dirs
                 )
                 logger.info(
-                    "spawn: pre-activated hive.colony-progress-tracker "
-                    "(catalog %d → %d chars) for worker with db_path=%s",
+                    "spawn: pre-activated skills %s "
+                    "(catalog %d → %d chars) for worker",
+                    _active_skills,
                     len(self.skills_catalog_prompt),
                     len(_spawn_catalog),
-                    input_data.get("db_path"),
                 )
             except Exception as exc:
                 logger.warning(
-                    "spawn: failed to pre-activate colony-progress-tracker skill, falling back to base catalog: %s",
+                    "spawn: failed to pre-activate skills %s, falling back to base catalog: %s",
+                    _active_skills,
                     exc,
                 )
 
@@ -1087,14 +1100,16 @@ class ColonyRuntime:
         *,
         tools_override: list[Any] | None = None,
         profile_name: str | None = None,
+        skills: list[str] | None = None,
     ) -> list[str]:
         """Spawn a batch of parallel workers, one per task spec.
 
-        Each task spec is a dict ``{"task": str, "data": dict | None}``.
-        Workers start as independent asyncio background tasks and run
-        concurrently; this method returns their IDs immediately without
-        waiting for completion. Use ``wait_for_worker_reports(ids,
-        timeout)`` to block until they all finish.
+        Each task spec is a dict ``{"task": str, "data": dict | None,
+        "skills"?: list[str]}``. Workers start as independent asyncio
+        background tasks and run concurrently; this method returns
+        their IDs immediately without waiting for completion. Use
+        ``wait_for_worker_reports(ids, timeout)`` to block until they
+        all finish.
 
         The overseer's ``run_parallel_workers`` tool is the usual
         caller; it pairs ``spawn_batch`` + ``wait_for_worker_reports``
@@ -1105,6 +1120,14 @@ class ColonyRuntime:
         by ``run_parallel_workers`` to drop tools whose credentials
         failed the pre-flight check (so the spawned workers don't
         waste a startup trying to use them).
+
+        ``skills`` is the BATCH-level skill attachment — every worker
+        gets these activated. Per-task ``skills`` in the spec dict
+        OVERRIDES the batch-level set for that one task (so a
+        heterogeneous fan-out can attach different skills to different
+        workers). Skills are pre-activated into the worker's
+        ``skills_catalog_prompt`` at spawn time so the body lands in
+        the system prompt from turn 0.
         """
         worker_ids: list[str] = []
         for spec in tasks:
@@ -1112,6 +1135,14 @@ class ColonyRuntime:
             task_data = spec.get("data")
             if task_data is not None and not isinstance(task_data, dict):
                 task_data = {"value": task_data}
+            # Per-task skills win over the batch default. Empty list ([])
+            # means "no skills" — distinct from missing key, which means
+            # "fall back to batch default".
+            per_task_skills = spec.get("skills")
+            if per_task_skills is None:
+                _skill_override = list(skills or [])
+            else:
+                _skill_override = list(per_task_skills)
             # Per-task profile_name override beats the batch-level default,
             # so a fan-out can mix profiles (e.g. half tasks routed to
             # Slack:work and half to Slack:personal).
@@ -1121,6 +1152,7 @@ class ColonyRuntime:
                 input_data=task_data or {"task": task_text},
                 tools=tools_override,
                 profile_name=spec.get("profile_name") or profile_name,
+                extra_skills=_skill_override or None,
             )
             worker_ids.extend(ids)
         return worker_ids

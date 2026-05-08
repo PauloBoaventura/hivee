@@ -309,7 +309,7 @@ async def test_run_parallel_workers_workers_inherit_only_queens_tools(
         # AgentLoops.
         captured: dict = {}
 
-        async def _capturing_spawn_batch(tasks, *, tools_override=None, profile_name=None):
+        async def _capturing_spawn_batch(tasks, *, tools_override=None, profile_name=None, skills=None):
             captured["tools_override"] = tools_override
             captured["task_count"] = len(tasks)
             return [f"w_{i}" for i in range(len(tasks))]
@@ -354,6 +354,144 @@ async def test_run_parallel_workers_workers_inherit_only_queens_tools(
         # Out-of-scope tools must NOT leak through.
         assert "tool_c" not in names
         assert "tool_d" not in names
+    finally:
+        await colony.stop()
+
+
+@pytest.mark.asyncio
+async def test_run_parallel_workers_threads_skills_to_spawn_batch(
+    tmp_path: Path,
+) -> None:
+    """Skills passed to run_parallel_workers must reach spawn_batch.
+
+    Both batch-level (every worker gets the same skills) and per-task
+    (one worker gets a different skill set) paths flow through
+    intact — that's how the queen factors shared protocol out of the
+    duplicated task strings.
+    """
+    from types import SimpleNamespace
+
+    bus = EventBus()
+    colony = ColonyRuntime(
+        agent_spec=AgentSpec(
+            id="t",
+            name="t",
+            description="t",
+            system_prompt="t",
+            agent_type="event_loop",
+        ),
+        goal=Goal(id="g", name="g", description="g"),
+        storage_path=tmp_path / "colony",
+        llm=_ByTaskMockLLM({}),
+        tools=[],
+        tool_executor=_stub_executor,
+        event_bus=bus,
+        colony_id="skills_test",
+        pipeline_stages=[],
+    )
+    await colony.start()
+    try:
+        captured: dict = {}
+
+        async def _capturing_spawn_batch(tasks, *, tools_override=None, profile_name=None, skills=None):
+            captured["batch_skills"] = skills
+            captured["task_skills"] = [t.get("skills") for t in tasks]
+            captured["task_count"] = len(tasks)
+            return [f"w_{i}" for i in range(len(tasks))]
+
+        colony.spawn_batch = _capturing_spawn_batch  # type: ignore[assignment]
+
+        session = _FakeSession(colony, "skills_test")
+        # Stub queen_executor so the strict-bound filter doesn't kick in.
+        session.queen_executor = SimpleNamespace(  # type: ignore[attr-defined]
+            node_registry={"queen": SimpleNamespace(_last_ctx=None)}
+        )
+
+        registry = ToolRegistry()
+        register_queen_lifecycle_tools(registry, session=session, session_id=session.id)
+        executor = registry.get_executor()
+
+        # Batch-level skills + one task with per-task override.
+        result = executor(
+            ToolUse(
+                id="tu",
+                name="run_parallel_workers",
+                input={
+                    "tasks": [
+                        {"task": "fill row 1"},
+                        {"task": "fill row 2"},
+                        {"task": "validate", "skills": ["validator-protocol"]},
+                    ],
+                    "skills": ["competitor-research-protocol"],
+                },
+            )
+        )
+        if asyncio.iscoroutine(result):
+            result = await result
+
+        assert not result.is_error, f"Tool errored: {result.content}"
+        assert captured["task_count"] == 3
+        # Batch-level reaches spawn_batch.
+        assert captured["batch_skills"] == ["competitor-research-protocol"]
+        # Tasks 0+1 don't override (None means "fall back to batch").
+        assert captured["task_skills"][0] is None
+        assert captured["task_skills"][1] is None
+        # Task 2 overrides with its own list.
+        assert captured["task_skills"][2] == ["validator-protocol"]
+    finally:
+        await colony.stop()
+
+
+@pytest.mark.asyncio
+async def test_spawn_batch_per_task_skills_overrides_batch_default(
+    tmp_path: Path,
+) -> None:
+    """ColonyRuntime.spawn_batch routes per-task skills to spawn() correctly.
+
+    Direct test of the dispatcher: per-task skills replace batch skills
+    for that one worker, missing per-task skills fall back to batch.
+    """
+    bus = EventBus()
+    colony = ColonyRuntime(
+        agent_spec=AgentSpec(id="t", name="t", description="t", system_prompt="t", agent_type="event_loop"),
+        goal=Goal(id="g", name="g", description="g"),
+        storage_path=tmp_path / "colony",
+        llm=_ByTaskMockLLM({}),
+        tools=[],
+        tool_executor=_stub_executor,
+        event_bus=bus,
+        colony_id="dispatch_test",
+        pipeline_stages=[],
+    )
+    await colony.start()
+    try:
+        captured: list[dict] = []
+
+        async def _capturing_spawn(*args, **kwargs):
+            captured.append(
+                {
+                    "extra_skills": kwargs.get("extra_skills"),
+                    "task": kwargs.get("task"),
+                }
+            )
+            return ["w"]
+
+        colony.spawn = _capturing_spawn  # type: ignore[assignment]
+
+        await colony.spawn_batch(
+            [
+                {"task": "default-skills"},  # falls back to batch
+                {"task": "override-empty", "skills": []},  # explicit empty = none
+                {"task": "override-set", "skills": ["x", "y"]},
+            ],
+            skills=["batch-default"],
+        )
+
+        assert len(captured) == 3
+        assert captured[0]["extra_skills"] == ["batch-default"]
+        # Empty list explicitly passed: spawn gets None (no skills).
+        assert captured[1]["extra_skills"] is None
+        assert captured[2]["extra_skills"] == ["x", "y"]
     finally:
         await colony.stop()
 

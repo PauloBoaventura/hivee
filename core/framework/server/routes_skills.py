@@ -38,7 +38,7 @@ from typing import Any
 from aiohttp import web
 
 from framework.config import COLONIES_DIR, QUEENS_DIR
-from framework.skills.authoring import (
+from framework.skills.skill_writer import (
     build_draft,
     remove_skill as authoring_remove_skill,
     validate_skill_name,

@@ -1089,6 +1089,7 @@ def register_queen_lifecycle_tools(
         tasks: list[dict],
         timeout: float | None = None,
         hard_timeout: float | None = None,
+        skills: list[str] | None = None,
     ) -> str:
         """Spawn N parallel workers and return immediately.
 
@@ -1337,12 +1338,21 @@ def register_queen_lifecycle_tools(
                 }
                 if _enqueued_task_ids[i]:
                     spec_data["task_id"] = _enqueued_task_ids[i]
-            normalised.append(
-                {
-                    "task": task_text,
-                    "data": spec_data or None,
-                }
-            )
+            entry: dict[str, Any] = {
+                "task": task_text,
+                "data": spec_data or None,
+            }
+            # Per-task skill attachment. When set, overrides the
+            # batch-level ``skills`` for that one task — used to give
+            # different workers different operational protocols
+            # (e.g. row-fillers vs validators) while still factoring
+            # the bulk of context out of the prose.
+            per_task_skills = spec.get("skills")
+            if isinstance(per_task_skills, list):
+                entry["skills"] = [str(s) for s in per_task_skills if s]
+            if spec.get("profile_name"):
+                entry["profile_name"] = str(spec["profile_name"])
+            normalised.append(entry)
 
         if _colony_db_path:
             _pinned = sum(1 for tid in _enqueued_task_ids if tid)
@@ -1395,6 +1405,7 @@ def register_queen_lifecycle_tools(
             worker_ids = await colony.spawn_batch(
                 normalised,
                 tools_override=tools_override_parallel,
+                skills=list(skills or []) or None,
             )
         except Exception as e:
             return json.dumps({"error": f"spawn_batch failed: {e}"})
@@ -1481,13 +1492,22 @@ def register_queen_lifecycle_tools(
             "back to you as a [WORKER_REPORT] user turn when it finishes, "
             "so you stay unblocked and can chat with the user, kick off "
             "more work, or do anything else in the meantime.\n\n"
-            "CRITICAL: each worker is a FRESH process with NO memory of "
-            "your conversation. Every task string must be FULLY "
-            "self-contained — include the API endpoint, the exact "
-            "parameters, the expected output format, and any "
-            "constraints. Workers cannot ask the user follow-up "
-            "questions and cannot see your chat history. Write each "
-            "task as if handing it to a stranger.\n\n"
+            "FACTOR SHARED CONTEXT INTO A SKILL FIRST. Each worker is a "
+            "fresh process with no memory of your conversation, but that "
+            "does NOT mean you should duplicate the same protocol prose "
+            "across N task strings. If 90% of every task string is the "
+            "same — schema, output format, quality bar, tools to use — "
+            "stop and call ``write_skill`` once with that common ground. "
+            "Then pass ``skills=['<your-skill-name>']`` (batch-level) or "
+            "set ``skills`` on each task spec so workers see the protocol "
+            "in their system prompt from turn 0. Each task string then "
+            "only needs the per-worker DIFFERENCES (which 5 companies, "
+            "which row IDs, which date range). Don't spend N×600 tokens "
+            "saying the same thing.\n\n"
+            "Per-task strings still need to be self-contained for the "
+            "*differences*: include row keys, IDs, URLs, anything unique "
+            "to that worker's slice. Workers cannot ask the user follow-up "
+            "questions and cannot see your chat history.\n\n"
             "Each worker runs in isolation with its own AgentLoop and "
             "reports back via the report_to_parent tool. The tool "
             "returns a JSON object with status='started' and the list "
@@ -1511,11 +1531,17 @@ def register_queen_lifecycle_tools(
                     "type": "array",
                     "description": (
                         "List of task specs to fan out. Each spec is "
-                        '{"task": "<description>", "data": {<optional structured input>}}. '
+                        '{"task": "<description>", "data": {<optional structured input>}, '
+                        '"skills": ["<skill-name>", ...]}. '
                         "The 'task' string becomes the worker's initial "
-                        "user message. 'data' is merged into the worker's "
+                        "user message — keep it tight and per-worker UNIQUE "
+                        "(don't duplicate the shared protocol). "
+                        "'data' is merged into the worker's "
                         "AgentContext.input_data so structured fields are "
-                        "available to the worker's first turn."
+                        "available to the worker's first turn. "
+                        "Per-task 'skills' overrides the batch-level "
+                        "'skills' for that one task — useful for mixing "
+                        "row-fillers with validators in the same fan-out."
                     ),
                     "items": {
                         "type": "object",
@@ -1528,10 +1554,32 @@ def register_queen_lifecycle_tools(
                                 "type": "object",
                                 "description": "Optional structured input fields.",
                             },
+                            "skills": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": (
+                                    "Per-task skill attachment (overrides batch 'skills')."
+                                ),
+                            },
                         },
                         "required": ["task"],
                     },
                     "minItems": 1,
+                },
+                "skills": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Batch-level skill attachment. Every spawned worker "
+                        "gets these skills pre-activated in their system "
+                        "prompt from turn 0. Use this to factor shared "
+                        "protocol (schema, quality bar, tool conventions) "
+                        "out of the per-task prose so each task string only "
+                        "carries the unique work. Author the skill first "
+                        "via write_skill, then reference it here. "
+                        "Per-task 'skills' on a task spec OVERRIDES this "
+                        "for that one task."
+                    ),
                 },
                 "timeout": {
                     "type": "number",
@@ -1557,6 +1605,183 @@ def register_queen_lifecycle_tools(
         "run_parallel_workers",
         _run_parallel_tool,
         lambda inputs: run_parallel_workers(**inputs),
+    )
+    tools_registered += 1
+
+    # --- write_skill ----------------------------------------------------------
+    #
+    # Author a colony-scoped skill at runtime. Companion to ``create_colony``
+    # (which authors the entry-point skill at fork time): once the colony
+    # is running and the queen learns more about the work, she can write
+    # NEW skills (or replace existing ones) so workers spawned by
+    # ``run_parallel_workers`` see the operational protocol in their
+    # system prompt from turn 0.
+    #
+    # The DRY motivation: when fanning out N workers with shared protocol
+    # (schema, output format, quality bar, tool conventions), the queen
+    # writes that protocol ONCE here and references it via
+    # ``run_parallel_workers(skills=['<name>'])``. Each task string then
+    # only carries the per-worker DIFFERENCES (which row IDs, which URLs).
+    # Without this tool the queen tends to duplicate ~600 words of
+    # protocol prose across every task spec — wasteful and brittle.
+
+    async def write_skill_tool(
+        *,
+        skill_name: str,
+        skill_description: str,
+        skill_body: str,
+        skill_files: list[dict] | None = None,
+    ) -> str:
+        """Write or replace a colony-scoped skill.
+
+        Resolves the colony from ``session.colony_name`` (or the live
+        ColonyRuntime) and writes
+        ``~/.hive/colonies/{colony_name}/skills/{skill_name}/``. The
+        skill is immediately available to subsequent ``run_parallel_workers``
+        calls via ``skills=[skill_name]``.
+
+        Replaces an existing skill of the same name in place — the
+        queen owns her colony-scoped skill namespace.
+        """
+        if session is None:
+            return json.dumps({"error": "No session bound to this tool registry."})
+
+        # Resolve colony_name from session (preferred) or live runtime.
+        colony_name_resolved = (
+            getattr(session, "colony_name", None)
+            or getattr(_get_unified_colony() or _get_runtime(), "_colony_id", None)
+        )
+        if not colony_name_resolved:
+            return json.dumps(
+                {
+                    "error": (
+                        "write_skill: no colony bound to this session. "
+                        "This tool only works once create_colony has run "
+                        "and you're operating inside the colony."
+                    )
+                }
+            )
+
+        from framework.config import COLONIES_DIR
+        from framework.skills.skill_writer import build_draft, write_skill
+
+        colony_dir = COLONIES_DIR / colony_name_resolved
+        try:
+            colony_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            return json.dumps({"error": f"failed to create colony dir: {e}"})
+
+        draft, draft_err = build_draft(
+            skill_name=skill_name,
+            skill_description=skill_description,
+            skill_body=skill_body,
+            skill_files=skill_files,
+        )
+        if draft_err is not None or draft is None:
+            return json.dumps(
+                {
+                    "error": draft_err or "invalid skill draft",
+                    "hint": (
+                        "Provide skill_name (lowercase [a-z0-9-], ≤64 chars), "
+                        "skill_description (single line, 1–1024 chars), and "
+                        "skill_body (the operational procedure: schema columns, "
+                        "tool conventions, output format, quality bar, gotchas). "
+                        "Use skill_files for optional scripts/references."
+                    ),
+                }
+            )
+
+        installed, write_err, replaced = write_skill(
+            draft,
+            target_root=colony_dir / "skills",
+            replace_existing=True,
+        )
+        if write_err is not None or installed is None:
+            return json.dumps({"error": write_err or "failed to write skill folder"})
+
+        return json.dumps(
+            {
+                "success": True,
+                "colony_name": colony_name_resolved,
+                "skill_name": draft.name,
+                "skill_path": str(installed),
+                "replaced": replaced,
+                "message": (
+                    f"Skill '{draft.name}' is ready. Reference it on "
+                    f"run_parallel_workers via skills=['{draft.name}'] "
+                    "(batch-level) or per-task; workers see the body in "
+                    "their system prompt from turn 0 — no need to repeat "
+                    "the protocol in the task string."
+                ),
+            }
+        )
+
+    _write_skill_tool = Tool(
+        name="write_skill",
+        description=(
+            "Write or replace a colony-scoped skill. Use this BEFORE "
+            "fanning out parallel workers when the per-task protocol is "
+            "the same across all workers (schema, output format, tool "
+            "conventions, quality bar). Writing the protocol ONCE into a "
+            "skill — then attaching it via run_parallel_workers(skills=[...]) "
+            "— is dramatically cheaper than duplicating the same prose "
+            "across N task strings, and keeps the protocol consistent.\n\n"
+            "Skill is colony-scoped: only THIS colony's workers see it. "
+            "Replacing an existing skill of the same name is fine — "
+            "your latest content wins. Workers spawned AFTER this call "
+            "pick it up; existing workers do not.\n\n"
+            "Skill body should read like a self-contained operating "
+            "procedure: what the worker is doing, the exact tools/schema "
+            "to use, the output format, what 'done' looks like. Skip "
+            "the per-worker specifics — those go in the task string."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "skill_name": {
+                    "type": "string",
+                    "description": (
+                        "Lowercase, hyphen-separated, ≤64 chars (e.g. "
+                        "'competitor-research-protocol')."
+                    ),
+                },
+                "skill_description": {
+                    "type": "string",
+                    "description": (
+                        "One-line summary of what this skill teaches a "
+                        "worker. Surfaced in the worker's skill catalog."
+                    ),
+                },
+                "skill_body": {
+                    "type": "string",
+                    "description": (
+                        "Markdown body of SKILL.md — the operational "
+                        "procedure the worker needs to run unattended."
+                    ),
+                },
+                "skill_files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "rel_path": {"type": "string"},
+                            "content": {"type": "string"},
+                        },
+                        "required": ["rel_path", "content"],
+                    },
+                    "description": (
+                        "Optional supporting files (scripts, JSON refs, "
+                        "etc.). Each entry is {rel_path, content}."
+                    ),
+                },
+            },
+            "required": ["skill_name", "skill_description", "skill_body"],
+        },
+    )
+    registry.register(
+        "write_skill",
+        _write_skill_tool,
+        lambda inputs: write_skill_tool(**inputs),
     )
     tools_registered += 1
 
@@ -1744,7 +1969,7 @@ def register_queen_lifecycle_tools(
 
         # Validate + write via the shared authoring module so the HTTP
         # routes and this tool stay in lockstep.
-        from framework.skills.authoring import build_draft, write_skill
+        from framework.skills.skill_writer import build_draft, write_skill
         from framework.skills.overrides import (
             OverrideEntry,
             Provenance,

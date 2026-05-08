@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from framework.skills.authoring import build_draft, write_skill
+from framework.skills.skill_writer import build_draft, write_skill
 from framework.skills.config import SkillsConfig
 from framework.skills.discovery import ExtraScope
 from framework.skills.manager import SkillsManager, SkillsManagerConfig
