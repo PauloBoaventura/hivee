@@ -1123,59 +1123,13 @@ def register_queen_lifecycle_tools(
         if not isinstance(tasks, list) or not tasks:
             return json.dumps({"error": "tasks must be a non-empty list of {task, data?} dicts"})
 
-        # Hard ceiling on a single fan-out call. A runaway queen requesting
-        # thousands of parallel workers would starve memory and drown the
-        # event loop; reject early with a clear error instead.
-        # Laptop-safe default (8); override via HIVE_RUN_PARALLEL_HARD_CAP.
-        _RUN_PARALLEL_HARD_CAP = 8
-        _cap_env = os.environ.get("HIVE_RUN_PARALLEL_HARD_CAP")
-        if _cap_env:
-            try:
-                _parsed = int(_cap_env)
-                if _parsed > 0:
-                    _RUN_PARALLEL_HARD_CAP = _parsed
-            except ValueError:
-                logger.warning(
-                    "Invalid HIVE_RUN_PARALLEL_HARD_CAP=%r; using default %d",
-                    _cap_env,
-                    _RUN_PARALLEL_HARD_CAP,
-                )
-        if len(tasks) > _RUN_PARALLEL_HARD_CAP:
-            return json.dumps(
-                {
-                    "error": (
-                        f"run_parallel_workers received {len(tasks)} tasks, "
-                        f"hard cap is {_RUN_PARALLEL_HARD_CAP}. Split the work "
-                        "into sequential batches or tighten the task list."
-                    )
-                }
-            )
-
-        # Global concurrency enforcement against ColonyConfig.max_concurrent_workers.
-        # The config field exists but was never checked anywhere — tracking
-        # it here so recursive fan-outs can't silently exceed the budget.
-        colony_cfg = getattr(colony, "_config", None) or getattr(colony, "config", None)
-        max_concurrent = getattr(colony_cfg, "max_concurrent_workers", None)
-        if max_concurrent and max_concurrent > 0:
-            active = 0
-            try:
-                workers = getattr(colony, "_workers", {}) or {}
-                for w in workers.values():
-                    handle = getattr(w, "_task_handle", None)
-                    if handle is not None and not handle.done():
-                        active += 1
-            except Exception:
-                active = 0
-            if active + len(tasks) > max_concurrent:
-                return json.dumps(
-                    {
-                        "error": (
-                            f"run_parallel_workers would exceed max_concurrent_workers "
-                            f"({active} active + {len(tasks)} new > {max_concurrent}). "
-                            "Wait for existing workers to finish or reduce batch size."
-                        )
-                    }
-                )
+        # Concurrency cap is enforced INSIDE the colony scheduler now,
+        # not here. spawn_batch admits all N tasks; whatever exceeds
+        # ``colony.max_concurrent_workers`` lands in the pending queue
+        # and starts as running peers terminate. The queen sees the
+        # split via ``running_now`` / ``queued`` in the immediate
+        # return below, and via ``batch_remaining`` (which counts both
+        # queued and running) on each [WORKER_REPORT].
 
         # Credential preflight — mirrors the one run_agent_with_input
         # performs. Without this, missing credentials (e.g. stale
@@ -1505,10 +1459,12 @@ def register_queen_lifecycle_tools(
 
         # Per-worker breadcrumbs the queen needs at spawn time to
         # correlate later reports: worker_id, the task slice each was
-        # given (preview), and the on-disk transcript path she can read
-        # if (and only if) the user asks for live progress on a
-        # specific worker.
+        # given (preview), the initial state (running vs queued), and
+        # the on-disk transcript path she can read if (and only if) the
+        # user asks for live progress on a specific worker.
         workers_breadcrumbs: list[dict[str, Any]] = []
+        running_now = 0
+        queued = 0
         for i, wid in enumerate(worker_ids):
             spec = normalised[i] if i < len(normalised) else {}
             task_text = str(spec.get("task", ""))
@@ -1516,20 +1472,34 @@ def register_queen_lifecycle_tools(
             if len(preview) > 200:
                 preview = preview[:200] + "…"
             output_file = ""
+            initial_status = "running"
             try:
                 w = colony._workers.get(wid) if hasattr(colony, "_workers") else None
                 if w is not None:
                     output_file = getattr(w, "output_file", "") or ""
+                    if getattr(w, "is_queued", False):
+                        initial_status = "queued"
+                        queued += 1
+                    else:
+                        running_now += 1
             except Exception:
-                output_file = ""
+                running_now += 1
             workers_breadcrumbs.append(
                 {
                     "worker_id": wid,
                     "task_index": i + 1,
                     "task_preview": preview,
                     "output_file": output_file,
+                    "initial_status": initial_status,
                 }
             )
+
+        # Read the colony's effective concurrency cap so the message
+        # text can reflect what the queen is actually working with.
+        try:
+            _max_concurrent = int(colony._config.max_concurrent_workers)
+        except Exception:
+            _max_concurrent = 0
 
         return json.dumps(
             {
@@ -1538,15 +1508,22 @@ def register_queen_lifecycle_tools(
                 "worker_count": len(worker_ids),
                 "worker_ids": worker_ids,
                 "workers": workers_breadcrumbs,
+                "running_now": running_now,
+                "queued": queued,
+                "max_concurrent_workers": _max_concurrent,
                 "soft_timeout_seconds": soft_timeout,
                 "hard_timeout_seconds": hard_timeout_effective,
                 "message": (
-                    "Workers running in the background. Each will report "
-                    "via a structured [WORKER_REPORT] user turn when it "
-                    "finishes, carrying <batch_remaining>N</batch_remaining>. "
-                    "Validate the tracker only AFTER batch_remaining=0 "
-                    "in a report — until then more results are still "
-                    "coming. Three rules:\n"
+                    f"Dispatched {len(worker_ids)} workers — {running_now} "
+                    f"running now, {queued} queued (colony cap: "
+                    f"{_max_concurrent}). Each emits one structured "
+                    "[WORKER_REPORT] user turn when it terminates, "
+                    "including queued workers; reports carry "
+                    "<batch_remaining>N</batch_remaining> covering BOTH "
+                    "still-running AND still-queued peers in this batch. "
+                    "Validate the tracker only AFTER you see "
+                    "<batch_remaining>0</batch_remaining> in a report — "
+                    "until then more results are still coming. Three rules:\n"
                     "  1. Don't poll: do NOT call get_worker_status just "
                     "to fill silence. Wait for [WORKER_REPORT].\n"
                     "  2. Don't fabricate: never predict, summarise, or "

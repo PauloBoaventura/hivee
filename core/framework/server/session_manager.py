@@ -1533,11 +1533,43 @@ class SessionManager:
         (Phase 4) is what activates it.
         """
         from framework.agent_loop.types import AgentSpec
-        from framework.host.colony_runtime import ColonyRuntime
+        from framework.host.colony_runtime import ColonyConfig, ColonyRuntime
         from framework.schemas.goal import Goal
 
         queen_tools = getattr(session, "_queen_tools", None) or []
         queen_tool_executor = getattr(session, "_queen_tool_executor", None)
+
+        # Resolve per-colony max_concurrent_workers from the colony's
+        # metadata.json (set at create_colony time from the queen's
+        # ``concurrency_hint``). Falls back to the framework default
+        # in ColonyConfig() when no override is configured. Pure DM
+        # sessions (no colony_name) always use the default — they
+        # never spawn parallel workers anyway.
+        _colony_config: ColonyConfig | None = None
+        try:
+            colony_name = getattr(session, "colony_name", None)
+            if colony_name:
+                from framework.config import COLONIES_DIR
+
+                _meta_path = COLONIES_DIR / colony_name / "metadata.json"
+                if _meta_path.exists():
+                    import json as _json
+
+                    _meta = _json.loads(_meta_path.read_text(encoding="utf-8"))
+                    _max_conc = _meta.get("max_concurrent_workers")
+                    if isinstance(_max_conc, int) and _max_conc > 0:
+                        _colony_config = ColonyConfig(max_concurrent_workers=_max_conc)
+                        logger.info(
+                            "_start_queen: applying colony cap "
+                            "max_concurrent_workers=%d for '%s'",
+                            _max_conc,
+                            colony_name,
+                        )
+        except Exception:
+            logger.debug(
+                "_start_queen: failed to read colony max_concurrent_workers (using default)",
+                exc_info=True,
+            )
 
         colony_spec = AgentSpec(
             id="queen_colony",
@@ -1557,23 +1589,26 @@ class SessionManager:
             description="Default goal for the session-level ColonyRuntime.",
         )
 
-        colony = ColonyRuntime(
-            agent_spec=colony_spec,
-            goal=colony_goal,
-            storage_path=queen_dir,
-            llm=session.llm,
-            tools=queen_tools,
-            tool_executor=queen_tool_executor,
-            event_bus=session.event_bus,
-            colony_id=session.id,
+        _colony_runtime_kwargs: dict[str, Any] = {
+            "agent_spec": colony_spec,
+            "goal": colony_goal,
+            "storage_path": queen_dir,
+            "llm": session.llm,
+            "tools": queen_tools,
+            "tool_executor": queen_tool_executor,
+            "event_bus": session.event_bus,
+            "colony_id": session.id,
             # Wire the on-disk colony name and queen id so
             # ColonyRuntime auto-derives its override paths. DM sessions
             # have no colony_name (session.colony_name is None), which
             # keeps them out of the per-colony JSON store.
-            colony_name=getattr(session, "colony_name", None),
-            queen_id=getattr(session, "queen_name", None) or None,
-            pipeline_stages=[],  # queen pipeline runs in queen_orchestrator, not here
-        )
+            "colony_name": getattr(session, "colony_name", None),
+            "queen_id": getattr(session, "queen_name", None) or None,
+            "pipeline_stages": [],  # queen pipeline runs in queen_orchestrator, not here
+        }
+        if _colony_config is not None:
+            _colony_runtime_kwargs["config"] = _colony_config
+        colony = ColonyRuntime(**_colony_runtime_kwargs)
 
         # Per-colony tool allowlist, loaded from the colony's metadata.json
         # when this session is attached to a real forked colony. For pure

@@ -212,20 +212,25 @@ validate by hand.
 
   3. **Fan out.** ``run_parallel_workers(tasks=[...], skills=[...])``. \
      Each task is the per-worker UNIQUE input — typically: row keys \
-     to fill, the table name, "follow the <skill> protocol". Returns \
-     immediately with a ``batch_id`` plus a ``workers`` list of \
-     {worker_id, task_index, task_preview, output_file}. Stay \
-     conversational with the user while workers run.
+     to fill, the table name, "follow the <skill> protocol". The \
+     immediate return tells you ``running_now`` (started immediately) \
+     and ``queued`` (waiting on the colony's concurrency cap, \
+     ``max_concurrent_workers``). The runtime promotes queued workers \
+     to running automatically as peers terminate — you do NOT need \
+     to manually split a large batch. Stay conversational with the \
+     user while workers churn through.
 
   4. **Wait for ``batch_remaining=0`` BEFORE validating.** Each \
      ``[WORKER_REPORT]`` is a structured block with \
-     ``<batch_remaining>N</batch_remaining>``. Until N hits 0 more \
-     results are still arriving — DO NOT validate yet, do not \
-     summarise the run for the user, do not dispatch follow-up work. \
-     When you see a report with ``<batch_remaining>0</batch_remaining>``, \
-     run ``tracker_sql('SELECT key FROM <table> WHERE <col> IS NULL \
-     OR <quality_check>')`` to find gaps in the data, NOT in the \
-     prose summaries. Re-dispatch only the gap rows with another \
+     ``<batch_remaining>N</batch_remaining>``. N counts BOTH \
+     still-running AND still-queued workers in this batch — until it \
+     hits 0 more results are still coming, including ones that \
+     haven't even started yet. DO NOT validate, summarise the run, \
+     or dispatch follow-up work until you see \
+     ``<batch_remaining>0</batch_remaining>`` in a report. Then run \
+     ``tracker_sql('SELECT key FROM <table> WHERE <col> IS NULL OR \
+     <quality_check>')`` to find gaps in the data, NOT in the prose \
+     summaries. Re-dispatch only the gap rows with another \
      ``run_parallel_workers`` — same skill, smaller task list. Loop \
      until clean.
 
@@ -381,10 +386,16 @@ the rest.
 - The ``skill_body`` must be FULL and self-contained — capture the \
   operational protocol (endpoints, auth, gotchas, pre-baked queries) \
   so the worker doesn't have to rediscover what you already know.
-- ``concurrency_hint`` (optional integer ≥ 1) — advisory cap on how \
-  many worker processes typically run in parallel for this colony \
-  (e.g. 1 for "send digest", 5 for a fan-out). Baked into worker.json \
-  for the future colony queen to consult; not enforced.
+- ``concurrency_hint`` (optional integer 1-32) — the colony's \
+  ENFORCED ``max_concurrent_workers`` cap. The runtime starts up to \
+  this many workers in parallel; ``run_parallel_workers`` calls \
+  beyond the cap have their excess tasks queued and promoted as \
+  peers terminate (no manual splitting needed). Pick based on the \
+  work shape: 1 for serial digest jobs, 4-8 for general fan-out, \
+  10-20 for many independent web fetches, low (1-2) for browser \
+  automation that fights over a single browser instance. Default \
+  is 4 (laptop-safe). You CANNOT change this post-fork — set it \
+  here based on what the colony will actually do.
 - ``triggers`` (optional array) — the colony's schedule, written \
   inline to ``triggers.json`` and auto-started on first colony load. \
   Pass this when the work is recurring / event-driven; omit for \

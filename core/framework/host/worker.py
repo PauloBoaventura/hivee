@@ -27,6 +27,11 @@ logger = logging.getLogger(__name__)
 
 
 class WorkerStatus(StrEnum):
+    # QUEUED: task spec is registered but no AgentLoop has started yet —
+    # the colony's max_concurrent_workers cap is currently saturated and
+    # this worker is waiting in ColonyRuntime._pending_queue for capacity.
+    # Promotes to PENDING when a running peer terminates.
+    QUEUED = "queued"
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
@@ -143,7 +148,18 @@ class Worker:
 
     @property
     def is_active(self) -> bool:
-        return self.status in (WorkerStatus.PENDING, WorkerStatus.RUNNING)
+        # QUEUED workers are "active" in the batch-tracking sense: their
+        # eventual report is still pending, so the queen-side
+        # batch_remaining counter must include them.
+        return self.status in (
+            WorkerStatus.QUEUED,
+            WorkerStatus.PENDING,
+            WorkerStatus.RUNNING,
+        )
+
+    @property
+    def is_queued(self) -> bool:
+        return self.status == WorkerStatus.QUEUED
 
     @property
     def batch_id(self) -> str:

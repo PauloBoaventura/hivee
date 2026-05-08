@@ -1644,6 +1644,26 @@ async def fork_session_into_colony(
     metadata["source_session_id"] = session.id
     metadata.setdefault("created_at", datetime.now(UTC).isoformat())
     metadata["updated_at"] = datetime.now(UTC).isoformat()
+    # Concurrency cap chosen at incubation. Promoted from the per-worker
+    # advisory metadata to a colony-level setting because the runtime
+    # uses it as the actual semaphore for parallel-worker scheduling.
+    # ColonyRuntime reads ``max_concurrent_workers`` on session start;
+    # values are clamped to a safety range to prevent a misconfigured
+    # colony saturating resources. Default (None / not set) falls back
+    # to the framework default in ColonyConfig.
+    if isinstance(concurrency_hint, int) and concurrency_hint > 0:
+        # Clamp to [1, 32]. Above 32 is almost certainly a configuration
+        # mistake on a single-machine deployment; users who actually need
+        # more should bump the env-controlled framework default.
+        clamped = max(1, min(32, concurrency_hint))
+        metadata["max_concurrent_workers"] = clamped
+        if clamped != concurrency_hint:
+            logger.info(
+                "create_colony: clamped concurrency_hint %d → %d for colony '%s'",
+                concurrency_hint,
+                clamped,
+                colony_name,
+            )
     metadata.setdefault("workers", {})
     metadata["workers"][worker_name] = {
         "task": worker_task[:100],

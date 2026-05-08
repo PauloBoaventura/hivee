@@ -56,9 +56,10 @@ Pick ONE decomposition axis per fan-out. Mixing axes in the same batch usually m
 
 ### Batch sizing
 
-- **Hard cap:** 8 parallel workers per `run_parallel_workers` call (HIVE_RUN_PARALLEL_HARD_CAP). If the user asked for more, batch sequentially: fan out 8, wait for reports, fan out 8 more.
-- **Practical sweet spot:** 3–5 workers per batch. Big enough to amortize spawn overhead, small enough that one slow worker doesn't keep the whole batch from reaching `[WORKER_REPORT]`.
-- **Per-worker work size:** aim for 2–10 minutes of worker time. Smaller = parallel overhead dominates; larger = blocks the soft-timeout (default 600s).
+- **No client-side cap.** Dispatch as many tasks as the goal needs in one `run_parallel_workers` call — the colony scheduler enforces the concurrency cap (`max_concurrent_workers`, set at incubation time via `create_colony(concurrency_hint=N)`, default 4). Tasks beyond the cap land in the runtime's pending queue and start automatically as running peers terminate. You'll see `running_now` and `queued` counts in the immediate tool return.
+- **You don't need to manually split.** "Send 30 tasks" with cap=4 means 4 run, 26 queue, and the runtime promotes them in FIFO order as workers report.
+- **Practical sweet spot per worker:** 2–10 minutes of work. Smaller and the spawn overhead dominates; larger and you hit the soft-timeout (default 600s).
+- **If most of your batch ends up queued, consider raising the cap at incubation.** Setting `concurrency_hint=20` for a colony of light web fetches is reasonable; setting it for a colony driving a single browser is not (the workers will fight over the same browser instance).
 
 ### Skills for fan-out
 

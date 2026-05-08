@@ -358,6 +358,21 @@ class ColonyRuntime:
 
         # Worker management
         self._workers: dict[str, Worker] = {}
+        # Pending fan-out queue. When spawn_batch is called with more
+        # tasks than colony.max_concurrent_workers can run at once, the
+        # excess tasks land here in FIFO order. Each entry is a fully
+        # realized Worker (status=QUEUED, no AgentLoop spawned yet)
+        # plus enough state to call ``_start_queued_worker`` later.
+        # Workers terminate via ``_publish_terminal_events``; the
+        # ``_drain_pending_queue`` callback runs after each terminal
+        # event and promotes queued workers to RUNNING up to the cap.
+        from collections import deque as _deque
+
+        self._pending_queue: _deque[Worker] = _deque()
+        # Lock guarding _pending_queue + _workers transitions when the
+        # scheduler is mid-promotion. Coarse-grained because we promote
+        # at most a handful at a time and the promotion path is short.
+        self._scheduler_lock = asyncio.Lock()
         # The persistent client-facing overseer (optional). Set by
         # ``start_overseer()`` at session start. In a DM session the
         # overseer is the queen chatting with the user with 0 parallel
@@ -658,6 +673,212 @@ class ColonyRuntime:
             if getattr(t, "name", None) not in self._mcp_tool_names_all or getattr(t, "name", None) in allowed
         ]
 
+    # ── Scheduler (parallel-worker concurrency cap + queueing) ──
+
+    def _running_worker_count(self, *, exclude_id: str | None = None) -> int:
+        """Count workers actively running (PENDING or RUNNING).
+
+        Excludes QUEUED workers (waiting to be promoted) and terminal
+        statuses. This is what we compare against
+        ``max_concurrent_workers`` to decide whether new work admits
+        immediately or queues.
+
+        ``exclude_id`` skips that worker from the count — used by the
+        admission decision so a freshly-registered worker (status
+        defaults to PENDING in __init__, before admission flips it)
+        doesn't count itself toward the cap.
+        """
+        from framework.host.worker import WorkerStatus
+
+        return sum(
+            1
+            for wid, w in self._workers.items()
+            if wid != exclude_id
+            and w.status in (WorkerStatus.PENDING, WorkerStatus.RUNNING)
+        )
+
+    async def _drain_pending_queue(self) -> int:
+        """Promote queued workers to running, up to the colony cap.
+
+        Returns the number of workers promoted on this drain. Callers:
+        - ``spawn`` after a fresh admission decision (in case the cap
+          shifted between the queue-decision and the drain).
+        - The SUBAGENT_REPORT subscriber after every worker terminal
+          event — that's the typical promotion trigger.
+
+        Idempotent and safe to over-call. The scheduler lock is held
+        for the dequeue + start_background sequence so two concurrent
+        drains can't both promote the same worker.
+        """
+        promoted = 0
+        async with self._scheduler_lock:
+            cap = self._config.max_concurrent_workers
+            while self._pending_queue and self._running_worker_count() < cap:
+                worker = self._pending_queue.popleft()
+                # Worker may have been cancelled between queue and drain
+                # (colony.stop on a queued worker synthesises a terminal
+                # report and dequeues separately). Defensive check.
+                from framework.host.worker import WorkerStatus
+
+                if worker.status != WorkerStatus.QUEUED:
+                    continue
+                # Promote: QUEUED → PENDING. start_background flips
+                # PENDING → RUNNING inside the run() coroutine.
+                worker.status = WorkerStatus.PENDING
+                try:
+                    await worker.start_background()
+                    promoted += 1
+                    logger.info(
+                        "Scheduler: promoted queued worker %s "
+                        "(batch=%s, idx=%d/%d) — now running %d/%d",
+                        worker.id,
+                        worker.batch_id or "-",
+                        worker.batch_index,
+                        worker.batch_size,
+                        self._running_worker_count(),
+                        cap,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Scheduler: failed to promote queued worker %s",
+                        worker.id,
+                    )
+                    worker.status = WorkerStatus.FAILED
+        return promoted
+
+    async def _on_worker_terminal_event(self, event: AgentEvent) -> None:
+        """Bus subscriber that drains the pending queue on each terminal.
+
+        Subscribed to SUBAGENT_REPORT during ``start()``. Every parallel
+        worker fires exactly one SUBAGENT_REPORT when it terminates
+        (success / failed / stopped / timeout / auto-failed); each one
+        is an opportunity to start a queued sibling.
+        """
+        # Filter: only drain when a worker we own just terminated.
+        # Reports from other colonies (cross-colony bus reach) shouldn't
+        # trigger our scheduler.
+        try:
+            data = event.data or {}
+            colony_id = data.get("colony_id")
+            if colony_id and colony_id != self._colony_id:
+                return
+            await self._drain_pending_queue()
+        except Exception:
+            logger.exception(
+                "Scheduler: drain on SUBAGENT_REPORT failed (non-fatal)"
+            )
+
+    async def _enqueue_or_admit_worker(self, worker: "Worker") -> bool:
+        """Decide whether to start a worker now or queue it.
+
+        Caller has already constructed the Worker (all heavy I/O —
+        storage dir, conversation fork, AgentLoop — is done) and added
+        it to ``self._workers``. We just decide whether to call
+        ``start_background()`` immediately (cap has slack) or stash in
+        ``_pending_queue`` (cap saturated).
+
+        Returns True when admitted (started), False when queued.
+        """
+        from framework.host.worker import WorkerStatus
+
+        async with self._scheduler_lock:
+            cap = self._config.max_concurrent_workers
+            # Exclude the worker being admitted: it's already in
+            # self._workers (added before this call) with the default
+            # PENDING status, but PENDING is what we count. Skipping
+            # it avoids self-counting that would push every batch's
+            # first worker straight into the queue.
+            running = self._running_worker_count(exclude_id=worker.id)
+            if running < cap:
+                # Slack available — go. start_background() will
+                # transition PENDING → RUNNING via worker.run().
+                await worker.start_background()
+                return True
+            # At cap. Queue.
+            worker.status = WorkerStatus.QUEUED
+            self._pending_queue.append(worker)
+            logger.info(
+                "Scheduler: queued worker %s "
+                "(batch=%s, idx=%d/%d) — running %d/%d, queue depth %d",
+                worker.id,
+                worker.batch_id or "-",
+                worker.batch_index,
+                worker.batch_size,
+                running,
+                cap,
+                len(self._pending_queue),
+            )
+            return False
+
+    async def _cancel_queued_workers(self) -> int:
+        """Synthesize terminal reports for any queued workers.
+
+        Called from ``stop()`` so the queen sees a clean
+        ``[WORKER_REPORT] status=stopped`` for every task that never
+        got to run. Without this, queued workers vanish silently when
+        the colony shuts down.
+
+        Returns the count of cancelled workers.
+        """
+        from framework.host.event_bus import AgentEvent, EventType
+        from framework.host.worker import WorkerStatus
+
+        cancelled = 0
+        async with self._scheduler_lock:
+            queued = list(self._pending_queue)
+            self._pending_queue.clear()
+        for worker in queued:
+            if worker.status != WorkerStatus.QUEUED:
+                continue
+            worker.status = WorkerStatus.STOPPED
+            # Synthesize the report directly on the bus — we can't go
+            # through Worker._emit_terminal_events because the worker
+            # never started (no result, no AgentLoop run state). Mirror
+            # the same shape so the queen-side formatter is happy.
+            if self._scoped_event_bus is not None:
+                try:
+                    await self._scoped_event_bus.publish(
+                        AgentEvent(
+                            type=EventType.SUBAGENT_REPORT,
+                            stream_id=worker._context.stream_id or worker.id,
+                            node_id=worker.id,
+                            execution_id=worker._context.execution_id or worker.id,
+                            data={
+                                "worker_id": worker.id,
+                                "colony_id": self._colony_id,
+                                "task": worker.task,
+                                "status": "stopped",
+                                "summary": (
+                                    "Worker was queued behind the "
+                                    "concurrency cap and never started — "
+                                    "the colony stopped before its slot "
+                                    "opened."
+                                ),
+                                "data": {},
+                                "error": None,
+                                "duration_seconds": 0.0,
+                                "tokens_used": 0,
+                                "batch_id": worker.batch_id,
+                                "batch_index": worker.batch_index,
+                                "batch_size": worker.batch_size,
+                                "output_file": worker.output_file,
+                            },
+                        )
+                    )
+                except Exception:
+                    logger.exception(
+                        "Scheduler: failed to synthesise stopped "
+                        "report for queued worker %s",
+                        worker.id,
+                    )
+            cancelled += 1
+        if cancelled:
+            logger.info(
+                "Scheduler: cancelled %d queued worker(s) on colony stop",
+                cancelled,
+            )
+        return cancelled
+
     # ── Lifecycle ───────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -668,6 +889,21 @@ class ColonyRuntime:
             await self._storage.start()
             await self._pipeline.initialize_all()
             self._apply_pipeline_results()
+
+            # Subscribe the scheduler to SUBAGENT_REPORT so the pending
+            # queue drains automatically as workers terminate. Stored
+            # in _event_subscriptions so it gets cleaned up in stop().
+            try:
+                _sched_sub = self._scoped_event_bus.subscribe(
+                    event_types=[EventType.SUBAGENT_REPORT],
+                    handler=self._on_worker_terminal_event,
+                )
+                self._event_subscriptions.append(_sched_sub)
+            except Exception:
+                logger.warning(
+                    "ColonyRuntime: failed to subscribe scheduler drain handler",
+                    exc_info=True,
+                )
 
             if self._config.webhook_routes:
                 from framework.host.webhook_server import (
@@ -707,6 +943,12 @@ class ColonyRuntime:
             return
 
         async with self._lock:
+            # Cancel queued workers FIRST. They never started so
+            # stop_all_workers() can't reach them through the running
+            # registry; without explicit cancellation they'd vanish
+            # silently and the queen would never see a [WORKER_REPORT]
+            # for that batch index.
+            await self._cancel_queued_workers()
             await self.stop_all_workers()
 
             # Cancel timer tasks and *wait* for them to finish. Without
@@ -1152,15 +1394,21 @@ class ColonyRuntime:
             )
 
             self._workers[worker_id] = worker
-            await worker.start_background()
+            # Scheduler decides: start now (cap has slack) or queue.
+            # Queued workers stay registered in self._workers but with
+            # status=QUEUED and no AgentLoop background task. The
+            # SUBAGENT_REPORT subscriber drains the queue automatically
+            # as running peers terminate.
+            admitted = await self._enqueue_or_admit_worker(worker)
             worker_ids.append(worker_id)
 
             logger.info(
-                "Spawned worker %s (%d/%d) using %s — task: %s",
+                "Spawned worker %s (%d/%d) using %s — %s — task: %s",
                 worker_id,
                 i + 1,
                 count,
                 "override spec" if agent_spec else "colony default spec",
+                "running" if admitted else "queued",
                 task[:80],
             )
 

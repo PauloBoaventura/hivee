@@ -1053,12 +1053,14 @@ async def create_queen(
                 output_file = data.get("output_file") or ""
 
                 # Compute remaining-in-batch from the live colony worker
-                # registry. We count workers in the same batch_id whose
-                # status is still active (PENDING/RUNNING). The reporting
-                # worker has just terminated, so it should NOT count
-                # itself — but its status flip is racy with this handler
-                # firing. Guard by also excluding ``worker_id`` from the
-                # count.
+                # registry. ``is_active`` covers QUEUED, PENDING, and
+                # RUNNING — so this counts both workers actively running
+                # AND workers waiting in the colony's pending queue
+                # (when the spawn exceeded max_concurrent_workers). The
+                # reporting worker has just terminated, so it should
+                # NOT count itself — but its status flip is racy with
+                # this handler firing. Guard by also excluding the
+                # current ``worker_id`` from the count.
                 batch_remaining = 0
                 if batch_id and batch_size > 0:
                     try:
