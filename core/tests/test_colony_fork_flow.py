@@ -134,6 +134,13 @@ def _make_session_with_queen_state(
             available_tools=[
                 SimpleNamespace(name="read_file"),
                 SimpleNamespace(name="search_files"),
+                # Tracker tools: simulate the queen having all three in
+                # her current phase list. The fork should keep
+                # tracker_upsert (worker-inheritable) and strip the two
+                # queen-only tools.
+                SimpleNamespace(name="tracker_sql"),
+                SimpleNamespace(name="tracker_register_writable"),
+                SimpleNamespace(name="tracker_upsert"),
             ],
             skills_catalog_prompt="<skills/>",
             protocols_prompt="<protocols/>",
@@ -329,11 +336,26 @@ async def test_colony_spawn_creates_correct_artifacts(tmp_path, monkeypatch):
     # not the queen and must not inherit her persona or global memory.
     assert worker_meta["identity_prompt"] == ""
     assert worker_meta["memory_prompt"] == ""
-    assert worker_meta["tools"] == ["read_file", "search_files"]
+    # Worker tool inheritance: tracker_upsert must flow through (workers
+    # write rows). The queen-only pair must be stripped.
+    assert "read_file" in worker_meta["tools"]
+    assert "search_files" in worker_meta["tools"]
+    assert "tracker_upsert" in worker_meta["tools"]
+    assert "tracker_sql" not in worker_meta["tools"]
+    assert "tracker_register_writable" not in worker_meta["tools"]
     assert worker_meta["skills_catalog_prompt"] == "<skills/>"
     assert worker_meta["protocols_prompt"] == "<protocols/>"
     assert worker_meta["loop_config"]["max_iterations"] == 42
     assert worker_meta["loop_config"]["max_tool_calls_per_turn"] == 7
+
+    # input_data carries both DB paths so the worker can find the queue
+    # (progress.db) and the queen-owned tracker (tracker.db) without
+    # guessing colony layout.
+    assert worker_meta["input_data"]["db_path"].endswith("/progress.db")
+    assert worker_meta["input_data"]["tracker_db_path"].endswith("/tracker.db")
+    assert worker_meta["input_data"]["colony_id"] == "honeycomb"
+    # tracker.db actually exists on disk after the fork.
+    assert (colony_dir / "data" / "tracker.db").exists()
 
     # ── duplicated queen session dir ──────────────────────────────
     dest_queen_dir = _queen_session_dir(colony_session_id, queen_name)

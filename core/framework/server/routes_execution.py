@@ -51,6 +51,11 @@ _WORKER_INHERITED_TOOLS: frozenset[str] = frozenset(
         "set_output",
         "escalate",
         "ask_user",
+        # Tracker write — workers fill rows in the queen's tracker.db.
+        # The queen-only ``tracker_sql`` and ``tracker_register_writable``
+        # are stripped automatically by _resolve_queen_only_tools because
+        # they're in the queen phase lists but NOT here.
+        "tracker_upsert",
     }
 )
 
@@ -1185,6 +1190,7 @@ async def fork_session_into_colony(
     from framework.agent_loop.agent_loop import AgentLoop, LoopConfig
     from framework.agent_loop.types import AgentContext
     from framework.host.progress_db import ensure_progress_db, seed_tasks
+    from framework.host.tracker_db import ensure_tracker_db
     from framework.server.session_manager import _queen_session_dir
 
     # Diagnostic capture: when the fork fails here we want to know which
@@ -1253,10 +1259,13 @@ async def fork_session_into_colony(
     colony_dir.mkdir(parents=True, exist_ok=True)
     (colony_dir / "data").mkdir(exist_ok=True)
 
-    # ── 0. Ensure the colony's progress DB exists and seed tasks ──
-    # Runs before worker.json is written so the DB path can be threaded
+    # ── 0. Ensure the colony's progress + tracker DBs exist and seed tasks ──
+    # Runs before worker.json is written so both DB paths can be threaded
     # into input_data. Idempotent on reruns of the same colony name.
+    # tracker.db is the queen-owned domain DB (separate from progress.db,
+    # which is the framework-owned task queue) — see framework.host.tracker_db.
     db_path = await asyncio.to_thread(ensure_progress_db, colony_dir)
+    tracker_db_path = await asyncio.to_thread(ensure_tracker_db, colony_dir)
     seeded_task_ids: list[str] = []
     if tasks:
         seeded_task_ids = await asyncio.to_thread(seed_tasks, db_path, tasks, source="queen_create")
@@ -1359,6 +1368,7 @@ async def fork_session_into_colony(
     # get their own task_id assigned at spawn time.
     _worker_input_data: dict[str, Any] = {
         "db_path": str(db_path),
+        "tracker_db_path": str(tracker_db_path),
         "colony_id": colony_name,
     }
     if seeded_task_ids:
@@ -1708,6 +1718,7 @@ async def fork_session_into_colony(
         "queen_session_id": colony_session_id,
         "is_new": is_new,
         "db_path": str(db_path),
+        "tracker_db_path": str(tracker_db_path),
         "task_ids": seeded_task_ids,
         # "in_progress" when a background compactor was scheduled above,
         # "skipped" when the source queen dir was missing (nothing to

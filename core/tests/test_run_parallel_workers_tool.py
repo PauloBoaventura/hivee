@@ -258,6 +258,107 @@ async def test_run_parallel_workers_returns_error_when_no_colony() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_parallel_workers_workers_inherit_only_queens_tools(
+    tmp_path: Path,
+) -> None:
+    """Spawned workers must NOT receive tools the parent queen herself
+    doesn't currently have (her phase tool list).
+
+    Setup: colony has a broader tool set [A, B, C, D]. The queen's
+    available_tools (her current phase) is the subset [A, B]. When she
+    fans out via run_parallel_workers, every spawned worker must get
+    only A and B.
+
+    Why: the queen is the authority. If a worker can call a tool the
+    queen herself can't, the queen is delegating capabilities she
+    doesn't own — surprising for the user, breaks the phase-gating
+    contract.
+    """
+    from types import SimpleNamespace
+
+    bus = EventBus()
+    # Colony tools: a broader set than the queen sees in her phase.
+    tool_a = Tool(name="tool_a", description="a")
+    tool_b = Tool(name="tool_b", description="b")
+    tool_c = Tool(name="tool_c", description="c — out of queen scope")
+    tool_d = Tool(name="tool_d", description="d — out of queen scope")
+    colony_tools = [tool_a, tool_b, tool_c, tool_d]
+
+    colony = ColonyRuntime(
+        agent_spec=AgentSpec(
+            id="t",
+            name="t",
+            description="t",
+            system_prompt="t",
+            agent_type="event_loop",
+        ),
+        goal=Goal(id="g", name="g", description="g"),
+        storage_path=tmp_path / "colony",
+        llm=_ByTaskMockLLM({}),
+        tools=colony_tools,
+        tool_executor=_stub_executor,
+        event_bus=bus,
+        colony_id="scope_test",
+        pipeline_stages=[],
+    )
+    await colony.start()
+    try:
+        # Capture spawn_batch's tools_override. We don't actually spawn
+        # workers — replace with a stub that records the arg and returns
+        # synthetic ids. This lets us assert the filter without booting
+        # AgentLoops.
+        captured: dict = {}
+
+        async def _capturing_spawn_batch(tasks, *, tools_override=None, profile_name=None):
+            captured["tools_override"] = tools_override
+            captured["task_count"] = len(tasks)
+            return [f"w_{i}" for i in range(len(tasks))]
+
+        colony.spawn_batch = _capturing_spawn_batch  # type: ignore[assignment]
+
+        # Build a fake queen executor whose available_tools is a SUBSET.
+        queen_loop = SimpleNamespace(_last_ctx=SimpleNamespace(available_tools=[tool_a, tool_b]))
+        queen_executor = SimpleNamespace(node_registry={"queen": queen_loop})
+
+        session = _FakeSession(colony, "scope_test")
+        session.queen_executor = queen_executor  # type: ignore[attr-defined]
+
+        registry = ToolRegistry()
+        register_queen_lifecycle_tools(registry, session=session, session_id=session.id)
+        executor = registry.get_executor()
+
+        result = executor(
+            ToolUse(
+                id="tu",
+                name="run_parallel_workers",
+                input={"tasks": [{"task": "x"}, {"task": "y"}]},
+            )
+        )
+        if asyncio.iscoroutine(result):
+            result = await result
+
+        assert not result.is_error, f"Tool errored: {result.content}"
+        # Debug: surface what actually happened.
+        assert "task_count" in captured, (
+            f"spawn_batch was never called. tool result: {result.content}"
+        )
+        # The override must be a strict subset of the queen's scope.
+        override = captured.get("tools_override")
+        assert override is not None, (
+            f"tools_override must be passed to spawn_batch. result={result.content}"
+        )
+        names = {getattr(t, "name", None) for t in override}
+        assert names == {"tool_a", "tool_b"}, (
+            f"workers must only see queen's tools [a,b], got {names}"
+        )
+        # Out-of-scope tools must NOT leak through.
+        assert "tool_c" not in names
+        assert "tool_d" not in names
+    finally:
+        await colony.stop()
+
+
+@pytest.mark.asyncio
 async def test_run_parallel_workers_validates_tasks_input() -> None:
     """Empty / non-list / missing-task-string inputs return structured errors."""
     bus = EventBus()

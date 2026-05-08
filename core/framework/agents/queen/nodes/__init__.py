@@ -80,6 +80,13 @@ _QUEEN_WORKING_TOOLS = [
     "stop_worker",
     # Fan out more tasks while workers are still running
     "run_parallel_workers",
+    # Tracker: queen-owned domain DB. tracker_sql is full SQL with
+    # denylist; tracker_register_writable opens a table for worker
+    # writes; tracker_upsert is shared with workers for symmetry but
+    # workers are the typical caller.
+    "tracker_sql",
+    "tracker_register_writable",
+    "tracker_upsert",
 ]
 
 # Reviewing phase: workers have finished. Queen summarises results,
@@ -98,6 +105,12 @@ _QUEEN_REVIEWING_TOOLS = [
     "set_trigger",
     "remove_trigger",
     "list_triggers",
+    # Tracker: same set as WORKING. The queen primarily reads here
+    # (tracker_sql with SELECT) to validate results, but DDL/DML stays
+    # available so she can patch up data she finds wrong while reviewing.
+    "tracker_sql",
+    "tracker_register_writable",
+    "tracker_upsert",
 ]
 
 

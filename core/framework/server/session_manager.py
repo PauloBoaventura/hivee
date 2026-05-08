@@ -162,6 +162,26 @@ class SessionManager:
         except Exception:
             logger.warning("progress_db: backfill at startup failed (non-fatal)", exc_info=True)
 
+        # Same backfill, but for tracker.db — the queen-owned domain DB
+        # introduced after progress.db. Older colonies don't have one yet;
+        # this creates it (empty bootstrap schema) and patches their
+        # worker configs with ``tracker_db_path``. Independent of the
+        # progress_db block: failure here must not break startup, and
+        # success there shouldn't gate this.
+        from framework.host.tracker_db import ensure_all_colony_tracker_dbs
+
+        try:
+            ensured_tracker = ensure_all_colony_tracker_dbs()
+            if ensured_tracker:
+                logger.info(
+                    "tracker_db: ensured %d colony tracker DB(s) at startup",
+                    len(ensured_tracker),
+                )
+        except Exception:
+            logger.warning(
+                "tracker_db: backfill at startup failed (non-fatal)", exc_info=True
+            )
+
     def build_llm(self, model: str | None = None):
         """Construct an LLM provider using the server's configured defaults."""
         from framework.config import RuntimeConfig, get_hive_config

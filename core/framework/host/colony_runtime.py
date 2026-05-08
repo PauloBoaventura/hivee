@@ -432,6 +432,23 @@ class ColonyRuntime:
                         exc_info=True,
                     )
 
+                # Tracker tools: workers get tracker_upsert only. The
+                # queen-only pair (tracker_sql, tracker_register_writable)
+                # is registered on the queen's separate registry. Even
+                # though worker.json's ``tools`` list is filtered at fork
+                # time, restricting registration here is defense-in-depth
+                # so a non-LLM caller can't invoke them through this
+                # registry's executor.
+                try:
+                    from framework.tools.tracker_tools import register_tracker_tools
+
+                    register_tracker_tools(stage.tool_registry, role="worker")
+                except Exception:
+                    logger.warning(
+                        "Failed to register tracker tools on pipeline registry",
+                        exc_info=True,
+                    )
+
                 tools = list(stage.tool_registry.get_tools().values())
                 if tools:
                     self._tools = tools

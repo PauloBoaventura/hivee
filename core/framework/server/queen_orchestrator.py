@@ -503,6 +503,17 @@ async def create_queen(
     if _colony_id_for_queen:
         register_colony_template_tools(queen_registry, colony_id=_colony_id_for_queen)
 
+    # ---- Tracker tools ------------------------------------------------
+    # The queen always gets all three (tracker_sql, tracker_register_writable,
+    # tracker_upsert). Phase tool lists in agents/queen/nodes filter which
+    # ones are visible per phase; the tracker tools are listed in WORKING
+    # and REVIEWING only. Workers inherit tracker_upsert through the fork
+    # snapshot — the queen-only pair is filtered out by
+    # ``_resolve_queen_only_tools`` so they never appear in worker.json.
+    from framework.tools.tracker_tools import register_tracker_tools
+
+    register_tracker_tools(queen_registry)
+
     # ---- Colony runtime check (only when worker is loaded) ----------------
     if session.colony_runtime:
         from framework.tools.worker_monitoring_tools import register_worker_monitoring_tools

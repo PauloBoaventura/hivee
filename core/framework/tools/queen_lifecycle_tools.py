@@ -1181,7 +1181,6 @@ def register_queen_lifecycle_tools(
         # every spawn via tools_override.
         legacy_for_preflight = _get_runtime()
         unavailable_tools_parallel: set[str] = set()
-        tools_override_parallel: list[Any] | None = None
         if legacy_for_preflight is not None:
             try:
                 unavailable_tools_parallel = await _preflight_credentials(
@@ -1205,27 +1204,67 @@ def register_queen_lifecycle_tools(
                     )
                 return json.dumps(error_payload)
 
-            # Always filter queen-lifecycle tools + any tools with missing
-            # credentials. Without the queen-only strip the spawned worker
-            # inherits run_parallel_workers / create_colony / switch_to_*,
-            # which lets it recurse or flip the parent queen's phase.
-            from framework.server.routes_execution import _resolve_queen_only_tools
+        # Always strip queen-lifecycle tools (run_parallel_workers,
+        # create_colony, switch_to_*) — without it the spawned worker
+        # could recurse or flip the parent queen's phase. This applies
+        # whether or not legacy preflight ran.
+        from framework.server.routes_execution import _resolve_queen_only_tools
 
-            queen_only = _resolve_queen_only_tools()
-            colony_tools = list(getattr(colony, "_tools", []) or [])
-            before = len(colony_tools)
-            tools_override_parallel = [
-                t
-                for t in colony_tools
-                if getattr(t, "name", None) not in queen_only
-                and getattr(t, "name", None) not in unavailable_tools_parallel
-            ]
-            dropped = before - len(tools_override_parallel)
-            if dropped:
-                logger.info(
-                    "run_parallel_workers: stripped %d queen/unavailable tool(s) from spawn_tools",
-                    dropped,
-                )
+        queen_only = _resolve_queen_only_tools()
+
+        # Strict bound: workers may only see tools the SPAWNING QUEEN
+        # currently has in her phase. Without this, workers get the
+        # entire colony pipeline's tool set (which can be a superset
+        # of what the queen herself can call), and the queen would be
+        # delegating capabilities she doesn't own. Read her current
+        # available_tools off the queen loop — same path
+        # ``fork_session_into_colony`` uses to snapshot the worker
+        # template at colony-creation time. None means "queen ctx not
+        # available, fall back to no scope filter" so legacy tests +
+        # cold-start sessions still work.
+        queen_tool_names: set[str] | None = None
+        try:
+            queen_executor = getattr(session, "queen_executor", None)
+            node_registry = getattr(queen_executor, "node_registry", None)
+            queen_loop = (
+                node_registry.get("queen") if isinstance(node_registry, dict) else None
+            )
+            queen_ctx = getattr(queen_loop, "_last_ctx", None)
+            if queen_ctx is not None:
+                queen_tool_names = {
+                    getattr(t, "name", None)
+                    for t in (queen_ctx.available_tools or [])
+                    if getattr(t, "name", None)
+                }
+        except Exception:
+            logger.debug(
+                "run_parallel_workers: failed to read queen available_tools; "
+                "falling back to full colony tool set",
+                exc_info=True,
+            )
+            queen_tool_names = None
+
+        colony_tools = list(getattr(colony, "_tools", []) or [])
+        before = len(colony_tools)
+        tools_override_parallel: list[Any] = [
+            t
+            for t in colony_tools
+            if getattr(t, "name", None) not in queen_only
+            and getattr(t, "name", None) not in unavailable_tools_parallel
+            and (
+                queen_tool_names is None
+                or getattr(t, "name", None) in queen_tool_names
+            )
+        ]
+        dropped = before - len(tools_override_parallel)
+        if dropped:
+            logger.info(
+                "run_parallel_workers: stripped %d tool(s) from spawn_tools "
+                "(queen-only / unavailable-credential / outside queen scope; "
+                "queen scope size=%s)",
+                dropped,
+                len(queen_tool_names) if queen_tool_names is not None else "n/a",
+            )
 
         # Colony progress tracker wiring: if the session's loaded
         # worker points at a colony directory that has a progress.db,
