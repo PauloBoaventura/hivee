@@ -309,7 +309,7 @@ async def test_run_parallel_workers_workers_inherit_only_queens_tools(
         # AgentLoops.
         captured: dict = {}
 
-        async def _capturing_spawn_batch(tasks, *, tools_override=None, profile_name=None, skills=None, loop_config_overrides=None):
+        async def _capturing_spawn_batch(tasks, *, tools_override=None, profile_name=None, skills=None, loop_config_overrides=None, batch_id=None):
             captured["tools_override"] = tools_override
             captured["task_count"] = len(tasks)
             return [f"w_{i}" for i in range(len(tasks))]
@@ -393,7 +393,7 @@ async def test_run_parallel_workers_threads_skills_to_spawn_batch(
     try:
         captured: dict = {}
 
-        async def _capturing_spawn_batch(tasks, *, tools_override=None, profile_name=None, skills=None, loop_config_overrides=None):
+        async def _capturing_spawn_batch(tasks, *, tools_override=None, profile_name=None, skills=None, loop_config_overrides=None, batch_id=None):
             captured["batch_skills"] = skills
             captured["task_skills"] = [t.get("skills") for t in tasks]
             captured["task_count"] = len(tasks)
@@ -533,9 +533,11 @@ async def test_run_parallel_workers_threads_budget_overrides_to_spawn_batch(
             profile_name=None,
             skills=None,
             loop_config_overrides=None,
+            batch_id=None,
         ):
             captured["batch_loop"] = loop_config_overrides
             captured["task_loops"] = [t.get("loop_config_overrides") for t in tasks]
+            captured["batch_id"] = batch_id
             return [f"w_{i}" for i in range(len(tasks))]
 
         colony.spawn_batch = _capturing_spawn_batch  # type: ignore[assignment]
@@ -656,6 +658,181 @@ class _AlwaysTextOnlyLLM(LLMProvider):
 
     def complete(self, messages, system="", **kwargs) -> LLMResponse:
         return LLMResponse(content="", model="mock", stop_reason="stop")
+
+
+@pytest.mark.asyncio
+async def test_run_parallel_workers_immediate_return_includes_batch_breadcrumbs(
+    tmp_path: Path,
+) -> None:
+    """The immediate response must carry batch_id, per-worker breadcrumbs
+    (worker_id, task_index, task_preview, output_file), and the three
+    discipline rules in the message text. Locked in so a future drift
+    can't silently strip the queen's correlation handles."""
+    from types import SimpleNamespace
+
+    bus = EventBus()
+    colony = ColonyRuntime(
+        agent_spec=AgentSpec(
+            id="t",
+            name="t",
+            description="t",
+            system_prompt="t",
+            agent_type="event_loop",
+        ),
+        goal=Goal(id="g", name="g", description="g"),
+        storage_path=tmp_path / "colony",
+        llm=_ByTaskMockLLM({}),
+        tools=[],
+        tool_executor=_stub_executor,
+        event_bus=bus,
+        colony_id="bc_test",
+        pipeline_stages=[],
+    )
+    await colony.start()
+    try:
+        # Stub spawn_batch so we don't actually spawn — but we DO want
+        # spawn() to populate _workers map with breadcrumbs the tool
+        # reads after spawn_batch returns. Easiest: override spawn_batch
+        # to populate _workers with stub objects exposing output_file.
+        async def _stub_spawn_batch(
+            tasks,
+            *,
+            tools_override=None,
+            profile_name=None,
+            skills=None,
+            loop_config_overrides=None,
+            batch_id=None,
+        ):
+            ids = [f"w_{i}" for i in range(len(tasks))]
+
+            async def _noop_stop():  # colony.stop() iterates _workers and awaits .stop()
+                return None
+
+            for wid in ids:
+                # Mimic Worker shape: output_file + is_active +
+                # the lifecycle methods colony.stop walks the registry to call.
+                colony._workers[wid] = SimpleNamespace(
+                    output_file=f"/tmp/colony/workers/{wid}/conversations/parts",
+                    is_active=False,  # already "done" so stop() doesn't iterate
+                    stop=_noop_stop,
+                    _task_handle=None,
+                )
+            return ids
+
+        colony.spawn_batch = _stub_spawn_batch  # type: ignore[assignment]
+
+        session = _FakeSession(colony, "bc_test")
+        session.queen_executor = SimpleNamespace(  # type: ignore[attr-defined]
+            node_registry={"queen": SimpleNamespace(_last_ctx=None)}
+        )
+        registry = ToolRegistry()
+        register_queen_lifecycle_tools(registry, session=session, session_id=session.id)
+        executor = registry.get_executor()
+
+        result = executor(
+            ToolUse(
+                id="tu",
+                name="run_parallel_workers",
+                input={
+                    "tasks": [
+                        {"task": "fill rows: a, b"},
+                        {"task": "fill rows: c, d, e — way longer prose " * 10},
+                    ],
+                },
+            )
+        )
+        if asyncio.iscoroutine(result):
+            result = await result
+        assert not result.is_error, result.content
+
+        payload = json.loads(result.content)
+        assert payload["status"] == "started"
+        # batch_id must be a non-empty string and follow the rpw_*
+        # prefix so logs / queen prompts can identify it.
+        assert isinstance(payload["batch_id"], str) and payload["batch_id"].startswith("rpw_")
+        # workers list mirrors per-task breadcrumbs.
+        assert isinstance(payload["workers"], list)
+        assert len(payload["workers"]) == 2
+        bc0 = payload["workers"][0]
+        assert bc0["worker_id"] == "w_0"
+        assert bc0["task_index"] == 1
+        assert bc0["task_preview"] == "fill rows: a, b"
+        assert bc0["output_file"].endswith("conversations/parts")
+        bc1 = payload["workers"][1]
+        # Long task strings get truncated to ≤200 chars + ellipsis.
+        assert bc1["task_index"] == 2
+        assert len(bc1["task_preview"]) <= 201
+        # The three disciplines must be present in the message — these
+        # are what teach the queen the structured-report contract.
+        msg = payload["message"]
+        assert "batch_remaining" in msg
+        assert "Don't poll" in msg
+        assert "Don't fabricate" in msg
+        assert "Don't peek" in msg
+    finally:
+        await colony.stop()
+
+
+@pytest.mark.asyncio
+async def test_subagent_report_carries_batch_metadata(tmp_path: Path) -> None:
+    """A worker spawned via spawn_batch must emit a SUBAGENT_REPORT with
+    batch_id, batch_index, batch_size, output_file populated. This is
+    what the queen-side handler reads to render the structured block."""
+    bus = EventBus()
+    llm = _ByTaskMockLLM(
+        by_task={
+            "task-A": _report("success", "A done", {"x": 1}),
+            "task-B": _report("success", "B done", {"y": 2}),
+        }
+    )
+    colony = ColonyRuntime(
+        agent_spec=AgentSpec(
+            id="t",
+            name="t",
+            description="t",
+            system_prompt="t",
+            agent_type="event_loop",
+            output_keys=[],
+            tool_access_policy="all",
+        ),
+        goal=Goal(id="g", name="g", description="g"),
+        storage_path=tmp_path / "colony",
+        llm=llm,
+        tools=[],
+        tool_executor=_stub_executor,
+        event_bus=bus,
+        colony_id="meta_test",
+        pipeline_stages=[],
+    )
+    await colony.start()
+    captured: list[dict] = []
+
+    async def _on_report(event: AgentEvent) -> None:
+        captured.append(event.data or {})
+
+    bus.subscribe(event_types=[EventType.SUBAGENT_REPORT], handler=_on_report)
+    try:
+        worker_ids = await colony.spawn_batch(
+            [{"task": "task-A"}, {"task": "task-B"}],
+        )
+        assert len(worker_ids) == 2
+
+        for _ in range(50):
+            if len(captured) >= 2:
+                break
+            await asyncio.sleep(0.1)
+        assert len(captured) == 2
+
+        # Both reports share the same batch_id.
+        batch_ids = {r.get("batch_id") for r in captured}
+        assert len(batch_ids) == 1, f"expected one batch_id, got {batch_ids}"
+        # Indices are 1 and 2 in some order.
+        assert sorted(r.get("batch_index") for r in captured) == [1, 2]
+        for r in captured:
+            assert r.get("batch_size") == 2
+            assert r.get("output_file", "").endswith("conversations/parts")
+    finally:
+        await colony.stop()
 
 
 @pytest.mark.asyncio

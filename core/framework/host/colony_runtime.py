@@ -899,6 +899,9 @@ class ColonyRuntime:
         profile_name: str | None = None,
         extra_skills: list[str] | None = None,
         loop_config_overrides: dict[str, Any] | None = None,
+        batch_id: str = "",
+        batch_index: int = 0,
+        batch_size: int = 0,
     ) -> list[str]:
         """Spawn worker clones and start them in the background.
 
@@ -1143,6 +1146,9 @@ class ColonyRuntime:
                 storage_path=worker_storage,
                 profile_name=_profile_name_resolved,
                 integrations=_profile_integrations,
+                batch_id=batch_id,
+                batch_index=batch_index,
+                batch_size=batch_size,
             )
 
             self._workers[worker_id] = worker
@@ -1168,6 +1174,7 @@ class ColonyRuntime:
         profile_name: str | None = None,
         skills: list[str] | None = None,
         loop_config_overrides: dict[str, Any] | None = None,
+        batch_id: str | None = None,
     ) -> list[str]:
         """Spawn a batch of parallel workers, one per task spec.
 
@@ -1196,8 +1203,23 @@ class ColonyRuntime:
         ``skills_catalog_prompt`` at spawn time so the body lands in
         the system prompt from turn 0.
         """
+        # Stamp every worker in this call with the same batch_id so the
+        # queen-side report formatter can correlate reports back to the
+        # spawn that produced them (and compute remaining-in-batch as
+        # workers complete). When the caller supplies an explicit
+        # batch_id we honor it (lets run_parallel_workers control the
+        # value it surfaces in its own return); otherwise we mint a
+        # short timestamped id here.
+        if not batch_id:
+            from datetime import UTC, datetime as _dt
+            import uuid as _uuid
+
+            batch_id = (
+                _dt.now(UTC).strftime("rpw_%Y%m%dT%H%M%SZ_") + _uuid.uuid4().hex[:8]
+            )
+        batch_size = len(tasks)
         worker_ids: list[str] = []
-        for spec in tasks:
+        for batch_index, spec in enumerate(tasks, start=1):
             task_text = str(spec.get("task", ""))
             task_data = spec.get("data")
             if task_data is not None and not isinstance(task_data, dict):
@@ -1231,6 +1253,9 @@ class ColonyRuntime:
                 profile_name=spec.get("profile_name") or profile_name,
                 extra_skills=_skill_override or None,
                 loop_config_overrides=_loop_override or None,
+                batch_id=batch_id,
+                batch_index=batch_index,
+                batch_size=batch_size,
             )
             worker_ids.extend(ids)
         return worker_ids

@@ -1021,7 +1021,7 @@ async def create_queen(
             phase_state.inject_notification = _inject_phase_notification
 
             async def _on_worker_report(event):
-                """Inject [WORKER_REPORT] into queen as each worker finishes.
+                """Inject a structured [WORKER_REPORT] block into the queen.
 
                 Subscribes to SUBAGENT_REPORT events which carry the worker's
                 real summary/data (preferring any explicit ``report_to_parent``
@@ -1030,6 +1030,12 @@ async def create_queen(
                 report as the next user turn and can react (reply to user,
                 kick off follow-up work, etc.) without being blocked by the
                 spawn call itself.
+
+                Output format is structured XML-style block so the queen
+                can identify which batch/slice each report came from and
+                whether more reports are still pending in the same batch
+                (batch_remaining > 0 ⇒ wait before validating the tracker;
+                batch_remaining == 0 ⇒ the whole batch has reported).
                 """
                 if event.stream_id == "queen":
                     return
@@ -1040,25 +1046,88 @@ async def create_queen(
                 err = data.get("error")
                 payload_data = data.get("data") or {}
                 duration = data.get("duration_seconds")
+                original_task = data.get("task") or ""
+                batch_id = data.get("batch_id") or ""
+                batch_index = data.get("batch_index") or 0
+                batch_size = data.get("batch_size") or 0
+                output_file = data.get("output_file") or ""
 
-                lines = ["[WORKER_REPORT]", f"worker_id: {worker_id}", f"status: {status}"]
+                # Compute remaining-in-batch from the live colony worker
+                # registry. We count workers in the same batch_id whose
+                # status is still active (PENDING/RUNNING). The reporting
+                # worker has just terminated, so it should NOT count
+                # itself — but its status flip is racy with this handler
+                # firing. Guard by also excluding ``worker_id`` from the
+                # count.
+                batch_remaining = 0
+                if batch_id and batch_size > 0:
+                    try:
+                        colony_runtime = getattr(session, "colony", None) or getattr(
+                            session, "colony_runtime", None
+                        )
+                        workers_map = getattr(colony_runtime, "_workers", {}) or {}
+                        for wid, w in workers_map.items():
+                            if wid == worker_id:
+                                continue
+                            if getattr(w, "_batch_id", "") != batch_id:
+                                continue
+                            if getattr(w, "is_active", False):
+                                batch_remaining += 1
+                    except Exception:
+                        # Best-effort — if anything explodes, fall back
+                        # to leaving remaining as 0 (queen treats the
+                        # current report as "the last one" and validates).
+                        # Same end-state as the legacy unstructured format.
+                        batch_remaining = 0
+
+                # Build the structured block. Using XML-ish tags so a
+                # reasoning model can parse fields cleanly without
+                # confusing them with surrounding prose.
+                lines: list[str] = ["[WORKER_REPORT]"]
+                lines.append(f"<worker_id>{worker_id}</worker_id>")
+                if batch_id:
+                    lines.append(f"<batch_id>{batch_id}</batch_id>")
+                    if batch_size > 0:
+                        lines.append(
+                            f"<task_index>{batch_index}</task_index>"
+                        )
+                        lines.append(f"<task_count>{batch_size}</task_count>")
+                        lines.append(
+                            f"<batch_remaining>{batch_remaining}</batch_remaining>"
+                        )
+                if original_task:
+                    # Cap to keep the report compact; the full task is
+                    # in the worker's own conversation if needed.
+                    preview = original_task.strip().replace("\n", " ")
+                    if len(preview) > 200:
+                        preview = preview[:200] + "…"
+                    lines.append(f"<original_task>{preview}</original_task>")
+                if output_file:
+                    lines.append(f"<output_file>{output_file}</output_file>")
+                lines.append(f"<status>{status}</status>")
                 if duration is not None:
                     try:
-                        lines.append(f"duration: {float(duration):.1f}s")
+                        lines.append(
+                            f"<duration_seconds>{float(duration):.1f}</duration_seconds>"
+                        )
                     except (TypeError, ValueError):
                         pass
-                lines.append(f"summary: {summary}")
+                lines.append(f"<summary>{summary}</summary>")
                 if err:
-                    lines.append(f"error: {err}")
+                    lines.append(f"<error>{err}</error>")
                 if payload_data:
                     # Compact JSON so the queen sees all keys without the
                     # indentation blowing up the turn's token count.
                     try:
                         import json as _json
 
-                        lines.append("data: " + _json.dumps(payload_data, ensure_ascii=False, default=str))
+                        lines.append(
+                            "<data>"
+                            + _json.dumps(payload_data, ensure_ascii=False, default=str)
+                            + "</data>"
+                        )
                     except Exception:
-                        lines.append(f"data: {payload_data!r}")
+                        lines.append(f"<data>{payload_data!r}</data>")
                 notification = "\n".join(lines)
 
                 await agent_loop.inject_event(notification)

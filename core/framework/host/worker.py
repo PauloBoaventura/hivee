@@ -86,6 +86,9 @@ class Worker:
         storage_path: Path | None = None,
         profile_name: str = "",
         integrations: dict[str, str] | None = None,
+        batch_id: str = "",
+        batch_index: int = 0,
+        batch_size: int = 0,
     ):
         self.id = worker_id
         self.task = task
@@ -101,6 +104,14 @@ class Worker:
         # An explicit ``account="..."`` arg on a tool call still wins.
         self._profile_name = profile_name
         self._integrations: dict[str, str] = dict(integrations or {})
+        # Batch coordinates. When this worker was spawned as part of a
+        # parallel fan-out (run_parallel_workers / spawn_batch), these
+        # let the queen-side report formatter render index/count and
+        # compute remaining-in-batch. Defaults are empty/0 for solo
+        # spawns (run_agent_with_input, the persistent overseer, etc.).
+        self._batch_id = batch_id
+        self._batch_index = batch_index
+        self._batch_size = batch_size
         # Canonical on-disk home for this worker (conversations, events,
         # result.json, data). Required when seed_conversation() is used —
         # we deliberately do NOT fall back to CWD, which previously caused
@@ -133,6 +144,35 @@ class Worker:
     @property
     def is_active(self) -> bool:
         return self.status in (WorkerStatus.PENDING, WorkerStatus.RUNNING)
+
+    @property
+    def batch_id(self) -> str:
+        """Batch identifier (set by spawn_batch). Empty for solo spawns."""
+        return self._batch_id
+
+    @property
+    def batch_index(self) -> int:
+        """1-based position of this worker in its batch. 0 for solo spawns."""
+        return self._batch_index
+
+    @property
+    def batch_size(self) -> int:
+        """Total tasks in this worker's batch. 0 for solo spawns."""
+        return self._batch_size
+
+    @property
+    def output_file(self) -> str:
+        """Filesystem path to this worker's conversation transcript dir.
+
+        Returns the empty string if the worker has no on-disk storage
+        (legacy or in-memory-only spawns). When set, points at
+        ``{storage}/conversations/parts/`` — the dir holding the
+        per-message JSON parts. The queen can list this dir or read
+        the latest part to inspect what the worker actually did.
+        """
+        if self._storage_path is None:
+            return ""
+        return str(self._storage_path / "conversations" / "parts")
 
     @property
     def is_persistent(self) -> bool:
@@ -389,6 +429,17 @@ class Worker:
                     "error": result.error,
                     "duration_seconds": result.duration_seconds,
                     "tokens_used": result.tokens_used,
+                    # Batch coordinates so the queen-side formatter can
+                    # render task_index/task_count and compute the
+                    # remaining-in-batch counter from the colony's
+                    # active worker registry. Empty/0 for solo spawns.
+                    "batch_id": self._batch_id,
+                    "batch_index": self._batch_index,
+                    "batch_size": self._batch_size,
+                    # On-disk path the queen can read to inspect the
+                    # full worker conversation when the user asks for
+                    # specifics. Empty when the worker has no storage.
+                    "output_file": self.output_file,
                 },
             )
         )

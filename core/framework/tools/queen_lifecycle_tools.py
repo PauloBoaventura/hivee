@@ -1424,12 +1424,22 @@ def register_queen_lifecycle_tools(
         if isinstance(max_context_tokens, int):
             batch_loop_overrides["max_context_tokens"] = max_context_tokens
 
+        # Mint the batch_id here so we can return it in the immediate
+        # response — the queen uses it to correlate the [WORKER_REPORT]s
+        # she'll receive against this specific spawn call.
+        from datetime import UTC as _UTC, datetime as _dt
+        import uuid as _uuid
+
+        batch_id = (
+            _dt.now(_UTC).strftime("rpw_%Y%m%dT%H%M%SZ_") + _uuid.uuid4().hex[:8]
+        )
         try:
             worker_ids = await colony.spawn_batch(
                 normalised,
                 tools_override=tools_override_parallel,
                 skills=list(skills or []) or None,
                 loop_config_overrides=batch_loop_overrides or None,
+                batch_id=batch_id,
             )
         except Exception as e:
             return json.dumps({"error": f"spawn_batch failed: {e}"})
@@ -1493,17 +1503,60 @@ def register_queen_lifecycle_tools(
                 exc,
             )
 
+        # Per-worker breadcrumbs the queen needs at spawn time to
+        # correlate later reports: worker_id, the task slice each was
+        # given (preview), and the on-disk transcript path she can read
+        # if (and only if) the user asks for live progress on a
+        # specific worker.
+        workers_breadcrumbs: list[dict[str, Any]] = []
+        for i, wid in enumerate(worker_ids):
+            spec = normalised[i] if i < len(normalised) else {}
+            task_text = str(spec.get("task", ""))
+            preview = task_text.strip().replace("\n", " ")
+            if len(preview) > 200:
+                preview = preview[:200] + "…"
+            output_file = ""
+            try:
+                w = colony._workers.get(wid) if hasattr(colony, "_workers") else None
+                if w is not None:
+                    output_file = getattr(w, "output_file", "") or ""
+            except Exception:
+                output_file = ""
+            workers_breadcrumbs.append(
+                {
+                    "worker_id": wid,
+                    "task_index": i + 1,
+                    "task_preview": preview,
+                    "output_file": output_file,
+                }
+            )
+
         return json.dumps(
             {
                 "status": "started",
+                "batch_id": batch_id,
                 "worker_count": len(worker_ids),
                 "worker_ids": worker_ids,
+                "workers": workers_breadcrumbs,
                 "soft_timeout_seconds": soft_timeout,
                 "hard_timeout_seconds": hard_timeout_effective,
                 "message": (
-                    "Workers running in the background. Each will report via "
-                    "[WORKER_REPORT] as it finishes. Reply to the user naturally "
-                    "in the meantime; you do not need to poll."
+                    "Workers running in the background. Each will report "
+                    "via a structured [WORKER_REPORT] user turn when it "
+                    "finishes, carrying <batch_remaining>N</batch_remaining>. "
+                    "Validate the tracker only AFTER batch_remaining=0 "
+                    "in a report — until then more results are still "
+                    "coming. Three rules:\n"
+                    "  1. Don't poll: do NOT call get_worker_status just "
+                    "to fill silence. Wait for [WORKER_REPORT].\n"
+                    "  2. Don't fabricate: never predict, summarise, or "
+                    "guess worker results before the report arrives. If "
+                    "the user asks before reports land, say workers are "
+                    "still running — give status, not a guess.\n"
+                    "  3. Don't peek: only inspect a worker's output_file "
+                    "when the user explicitly asks for live progress on "
+                    "a specific worker; routine validation goes through "
+                    "the tracker (tracker_sql), not the transcript."
                 ),
             }
         )
