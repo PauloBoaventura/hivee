@@ -101,6 +101,42 @@ def test_check_openrouter_429(monkeypatch):
     assert result == {"valid": True, "message": "OpenRouter API key valid"}
 
 
+def test_check_anthropic_compatible_uses_requested_model(monkeypatch):
+    module = _load_check_llm_key_module()
+    calls = {}
+
+    class FakeResponse:
+        status_code = 400
+
+    class FakeClient:
+        def __init__(self, timeout):
+            calls["timeout"] = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, endpoint, headers, json):
+            calls["endpoint"] = endpoint
+            calls["headers"] = headers
+            calls["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr(module.httpx, "Client", FakeClient)
+
+    result = module.check_anthropic_compatible(
+        "test-key",
+        "https://api.kimi.com/coding/v1/messages",
+        "Kimi",
+        model="kimi-k2.6",
+    )
+
+    assert result == {"valid": True, "message": "Kimi API key valid"}
+    assert calls["json"]["model"] == "kimi-k2.6"
+
+
 def test_check_openrouter_model_200(monkeypatch):
     result, calls = _run_openrouter_model_check(
         monkeypatch,

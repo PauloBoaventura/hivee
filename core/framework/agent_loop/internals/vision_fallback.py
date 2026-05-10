@@ -199,7 +199,7 @@ async def caption_tool_image(
     # Apply the same proxy rewrites the main LLM provider uses so a
     # `hive/...` / `kimi/...` model resolves to the right Anthropic-
     # compatible endpoint with the right auth header. Without this,
-    # litellm doesn't know what `hive/kimi-k2.5` is and rejects the call
+    # litellm doesn't know what `hive/kimi-k2.x` is and rejects the call
     # with "LLM Provider NOT provided."
     from framework.llm.litellm import rewrite_proxy_model
 

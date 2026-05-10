@@ -255,7 +255,13 @@ def check_minimax(api_key: str, api_base: str = "https://api.minimax.io/v1", **_
     return {"valid": False, "message": f"MiniMax API returned status {r.status_code}"}
 
 
-def check_anthropic_compatible(api_key: str, endpoint: str, name: str) -> dict:
+def check_anthropic_compatible(
+    api_key: str,
+    endpoint: str,
+    name: str,
+    *,
+    model: str = "kimi-k2.6",
+) -> dict:
     """POST empty messages to an Anthropic-compatible endpoint to validate key."""
     with httpx.Client(timeout=TIMEOUT) as client:
         r = client.post(
@@ -265,7 +271,7 @@ def check_anthropic_compatible(api_key: str, endpoint: str, name: str) -> dict:
                 "anthropic-version": "2023-06-01",
                 "Content-Type": "application/json",
             },
-            json={"model": "kimi-k2.5", "max_tokens": 1, "messages": []},
+            json={"model": model, "max_tokens": 1, "messages": []},
         )
     if r.status_code in (200, 400, 429):
         return {"valid": True, "message": f"{name} API key valid"}
@@ -305,9 +311,19 @@ PROVIDERS = {
     "minimax": lambda key, **_: check_minimax(key),
     # Kimi For Coding uses an Anthropic-compatible endpoint; check via /v1/messages
     # with empty messages (same as check_anthropic, triggers 400 not 401).
-    "kimi": lambda key, **kw: check_anthropic_compatible(key, "https://api.kimi.com/coding/v1/messages", "Kimi"),
+    "kimi": lambda key, **kw: check_anthropic_compatible(
+        key,
+        "https://api.kimi.com/coding/v1/messages",
+        "Kimi",
+        model=kw.get("model") or "kimi-k2.6",
+    ),
     # Hive LLM uses an Anthropic-compatible endpoint
-    "hive": lambda key, **kw: check_anthropic_compatible(key, f"{HIVE_LLM_ENDPOINT}/v1/messages", "Hive"),
+    "hive": lambda key, **kw: check_anthropic_compatible(
+        key,
+        f"{HIVE_LLM_ENDPOINT}/v1/messages",
+        "Hive",
+        model=kw.get("model") or "queen",
+    ),
 }
 
 
@@ -341,9 +357,19 @@ def main() -> None:
             result = check_openrouter(api_key, api_base)
         elif api_base and provider_id == "kimi":
             # Kimi uses an Anthropic-compatible endpoint; check via /v1/messages
-            result = check_anthropic_compatible(api_key, api_base.rstrip("/") + "/v1/messages", "Kimi")
+            result = check_anthropic_compatible(
+                api_key,
+                api_base.rstrip("/") + "/v1/messages",
+                "Kimi",
+                model=model or "kimi-k2.6",
+            )
         elif api_base and provider_id == "hive":
-            result = check_anthropic_compatible(api_key, api_base.rstrip("/") + "/v1/messages", "Hive")
+            result = check_anthropic_compatible(
+                api_key,
+                api_base.rstrip("/") + "/v1/messages",
+                "Hive",
+                model=model or "queen",
+            )
         elif api_base:
             # Custom API base (ZAI or other OpenAI-compatible)
             endpoint = api_base.rstrip("/") + "/models"

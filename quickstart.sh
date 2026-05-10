@@ -1469,7 +1469,7 @@ case $choice in
         SIGNUP_URL="https://www.kimi.com/code"
         echo ""
         echo -e "${GREEN}⬢${NC} Using Kimi Code subscription"
-        echo -e "  ${DIM}Model: kimi-k2.5 | API: api.kimi.com/coding${NC}"
+        echo -e "  ${DIM}Model: kimi-k2.6 | API: api.kimi.com/coding${NC}"
         ;;
     6)
         # Hive LLM

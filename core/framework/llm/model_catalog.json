@@ -297,12 +297,25 @@
       ]
     },
     "kimi": {
-      "default_model": "kimi-k2.5",
+      "default_model": "kimi-k2.6",
       "models": [
         {
-          "id": "kimi-k2.5",
-          "label": "Kimi K2.5 - Best coding",
+          "id": "kimi-k2.6",
+          "label": "Kimi K2.6 - Best coding",
           "recommended": true,
+          "max_tokens": 32768,
+          "max_context_tokens": 262144,
+          "pricing_usd_per_mtok": {
+            "input": 0.95,
+            "output": 4.00,
+            "cache_read": 0.16
+          },
+          "supports_vision": true
+        },
+        {
+          "id": "kimi-k2.5",
+          "label": "Kimi K2.5 - Previous coding model",
+          "recommended": false,
           "max_tokens": 32768,
           "max_context_tokens": 200000,
           "pricing_usd_per_mtok": {
@@ -324,6 +337,14 @@
           "max_tokens": 32768,
           "max_context_tokens": 180000,
           "supports_vision": false
+        },
+        {
+          "id": "kimi-k2.6",
+          "label": "Kimi 2.6 - Via Hive",
+          "recommended": false,
+          "max_tokens": 32768,
+          "max_context_tokens": 262144,
+          "supports_vision": true
         },
         {
           "id": "kimi-k2.5",
@@ -470,9 +491,9 @@
     "kimi_code": {
       "provider": "kimi",
       "api_key_env_var": "KIMI_API_KEY",
-      "model": "kimi-k2.5",
+      "model": "kimi-k2.6",
       "max_tokens": 32768,
-      "max_context_tokens": 240000,
+      "max_context_tokens": 262144,
       "api_base": "https://api.kimi.com/coding"
     },
     "hive_llm": {
@@ -487,6 +508,11 @@
           "id": "queen",
           "label": "queen",
           "recommended": true
+        },
+        {
+          "id": "kimi-k2.6",
+          "label": "kimi-k2.6",
+          "recommended": false
         },
         {
           "id": "kimi-k2.5",

@@ -115,7 +115,7 @@ Hive LLM:
 Notes:
 
 - Set `provider` to `hive`
-- Common Hive model values are `queen`, `kimi-k2.5`, and `GLM-5`
+- Common Hive model values are `queen`, `kimi-k2.6`, `kimi-k2.5`, and `GLM-5`
 - Hive LLM requests use the Hive endpoint at `https://api.adenhq.com`
 
 ### Search & Tools (optional)

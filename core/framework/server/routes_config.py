@@ -334,9 +334,19 @@ async def _validate_provider_key(
             if api_base and pid == "openrouter":
                 return check_openrouter(api_key, api_base)
             if api_base and pid == "kimi":
-                return check_anthropic_compatible(api_key, api_base.rstrip("/") + "/v1/messages", "Kimi")
+                return check_anthropic_compatible(
+                    api_key,
+                    api_base.rstrip("/") + "/v1/messages",
+                    "Kimi",
+                    model=model or "kimi-k2.6",
+                )
             if api_base and pid == "hive":
-                return check_anthropic_compatible(api_key, api_base.rstrip("/") + "/v1/messages", "Hive")
+                return check_anthropic_compatible(
+                    api_key,
+                    api_base.rstrip("/") + "/v1/messages",
+                    "Hive",
+                    model=model or "queen",
+                )
             if api_base:
                 endpoint = api_base.rstrip("/") + "/models"
                 name = {"zai": "ZAI"}.get(pid, "Custom provider")
@@ -427,7 +437,7 @@ async def handle_update_llm_config(request: web.Request) -> web.Response:
                 status=400,
             )
 
-        check = await _validate_provider_key(provider, token, api_base=api_base)
+        check = await _validate_provider_key(provider, token, api_base=api_base, model=model)
         if check.get("valid") is False:
             return web.json_response(
                 {"error": f"{sub['name']} key validation failed: {check.get('message', 'unknown error')}"},

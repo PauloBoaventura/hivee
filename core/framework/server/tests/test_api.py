@@ -1686,7 +1686,7 @@ class TestConfigRoutes:
         subscriptions = {subscription["id"]: subscription for subscription in data["subscriptions"]}
         assert subscriptions["codex"]["default_model"] == "gpt-5.3-codex"
         assert subscriptions["codex"]["api_base"] == "https://chatgpt.com/backend-api/codex"
-        assert subscriptions["kimi_code"]["default_model"] == "kimi-k2.5"
+        assert subscriptions["kimi_code"]["default_model"] == "kimi-k2.6"
 
 
 class TestSSEFormat:

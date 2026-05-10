@@ -21,6 +21,7 @@ class TestSupportsImageToolResults:
             "gpt-5.4",
             "gpt-5.4-mini",
             "gemini-3-flash-preview",
+            "kimi-k2.6",
             "kimi-k2.5",
             # Provider-prefixed catalog entries
             "openrouter/openai/gpt-5.4",

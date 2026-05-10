@@ -997,7 +997,7 @@ async def create_queen(
                 # Honor configuration.json (llm.max_tokens) instead of
                 # hard-defaulting to 8192. The legacy fallback ignored both
                 # the user's saved ceiling AND the model's actual output
-                # capacity (e.g. glm-5.1 / kimi-k2.5 both support 32k out),
+                # capacity (e.g. glm-5.1 / Kimi K2.x both support 32k out),
                 # which silently truncated long tool-emitting turns.
                 max_tokens=lc.get("max_tokens", _get_max_tokens()),
                 stream_id="queen",

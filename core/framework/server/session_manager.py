@@ -723,7 +723,7 @@ class SessionManager:
             goal_context=goal.to_prompt_context(),
             goal=goal,
             # Worker output cap — pull from configuration.json instead of
-            # hard-coding 8192. glm-5.1/kimi-k2.5 both support 32k out, and
+            # hard-coding 8192. glm-5.1/Kimi K2.x both support 32k out, and
             # capping at 8k silently truncates long worker turns mid-tool.
             max_tokens=get_max_tokens(),
             stream_id=worker_name,

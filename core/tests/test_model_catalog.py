@@ -179,9 +179,9 @@ def test_get_preset_returns_subscription_specific_limits():
 
     assert preset is not None
     assert preset["provider"] == "kimi"
-    assert preset["model"] == "kimi-k2.5"
+    assert preset["model"] == "kimi-k2.6"
     assert preset["max_tokens"] == 32768
-    assert preset["max_context_tokens"] == 240000
+    assert preset["max_context_tokens"] == 262144
     assert preset["api_base"] == "https://api.kimi.com/coding"
 
 

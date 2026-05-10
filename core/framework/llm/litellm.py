@@ -2706,7 +2706,7 @@ class LiteLLMProvider(LLMProvider):
 
             except Exception as e:
                 # Some providers return non-standard finish_reason values
-                # (e.g., kimi-k2.5 sends 'pause_turn') that LiteLLM's
+                # (e.g., Kimi K2.x sends 'pause_turn') that LiteLLM's
                 # internal stream_chunk_builder rejects via Pydantic
                 # validation.  If we already accumulated content and built
                 # tail_events before the error, the stream was successful —
