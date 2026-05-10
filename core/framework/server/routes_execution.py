@@ -1334,91 +1334,49 @@ async def fork_session_into_colony(
     queen_protocols = queen_ctx.protocols_prompt if queen_ctx else ""
     queen_skill_dirs = queen_ctx.skill_dirs if queen_ctx else []
 
-    # Build a focused, worker-scoped system prompt. We deliberately do
-    # NOT inherit the queen's identity_prompt or her phase-specific prompt
-    # (building / running / etc.) -- those describe "how to be a queen"
-    # and confuse the worker into greeting the user as Charlotte with no
-    # memory. The worker is a task executor; give it a task-focused brief.
-    worker_task = task or "Continue the work from the queen's current session."
-    worker_system_prompt = (
-        "You are a focused worker agent spawned by the queen to carry out "
-        "one specific task. Read the goal carefully, use your available "
-        "tools to make progress, and call set_output when complete.\n\n"
-        "FAIL FAST. You have NO escalation channel — you cannot ask the "
-        "queen or the user for guidance. If you can't complete the task "
-        "(missing info, blocked, repeated tool failure, scope ambiguity), "
-        "call ``report_to_parent(status='failed', summary=<one-paragraph "
-        "reason>, data=<any partial state>)`` and stop. The queen reads "
-        "the failure and either re-dispatches you with different "
-        "parameters or takes over. Do NOT loop trying alternative "
-        "workarounds for >2-3 attempts; surface the failure cleanly.\n\n"
-        f"Task: {worker_task}"
+    # ── 2. Build + write worker.json ────────────────────────────
+    # The worker spec lives in ``agents.queen.worker_definition`` —
+    # that module is the single source of truth for both the runtime
+    # identity (Goal, prompt, loop config defaults) and the on-disk
+    # serialization format (worker.json dict). Per-profile clones
+    # below build off ``dict(worker_meta)`` so any future field
+    # addition lands once. identity_prompt + memory_prompt are
+    # intentionally empty (worker is a task executor, not the queen)
+    # and the system prompt teaches report_to_parent / fail-fast /
+    # attached-skills / tracker conventions inside
+    # ``worker_definition.build_system_prompt``.
+    from framework.agents.queen.worker_definition import (
+        build_input_data,
+        build_meta,
     )
 
-    queen_lc_config: dict = {
-        "max_iterations": 999_999,
-        "max_tool_calls_per_turn": 30,
-        "max_context_tokens": 180_000,
-    }
+    _worker_input_data = build_input_data(
+        db_path=str(db_path),
+        tracker_db_path=str(tracker_db_path),
+        colony_id=colony_name,
+        seeded_task_id=seeded_task_ids[0] if seeded_task_ids else None,
+    )
+
     queen_config: LoopConfig | None = getattr(queen_loop, "_config", None)
-    if queen_config is not None:
-        queen_lc_config["max_iterations"] = queen_config.max_iterations
-        queen_lc_config["max_tool_calls_per_turn"] = queen_config.max_tool_calls_per_turn
-        queen_lc_config["max_context_tokens"] = queen_config.max_context_tokens
-        queen_lc_config["max_tool_result_chars"] = queen_config.max_tool_result_chars
+    worker_task = task or "Continue the work from the queen's current session."
 
-    # ── 2. Write worker.json (create or update) ──────────────────
-    # identity_prompt and memory_prompt are intentionally EMPTY -- the
-    # worker is not Charlotte / Alexandra / etc., it is a task executor.
-    # Inheriting the queen's persona made the worker greet the user in
-    # first person with no memory of the task it was actually given.
-    # Thread the first seeded task_id into input_data so the worker's
-    # first claim pins to a specific row (skill's assigned-task-id
-    # branch). When multiple tasks were seeded we only pin the first —
-    # subsequent workers (via run_agent_with_input or parallel spawns)
-    # get their own task_id assigned at spawn time.
-    _worker_input_data: dict[str, Any] = {
-        "db_path": str(db_path),
-        "tracker_db_path": str(tracker_db_path),
-        "colony_id": colony_name,
-    }
-    if seeded_task_ids:
-        _worker_input_data["task_id"] = seeded_task_ids[0]
-
-    worker_meta = {
-        "name": worker_name,
-        "version": "1.0.0",
-        "description": f"Worker clone from queen session {session.id}",
-        # Colony progress tracker: worker sees these in its first user
-        # message via _format_spawn_task_message.  The colony-progress-
-        # tracker default skill teaches the worker how to use them.
-        "input_data": _worker_input_data,
-        "goal": {
-            "description": worker_task,
-            "success_criteria": [],
-            "constraints": [],
-        },
-        "system_prompt": worker_system_prompt,
-        "tools": tool_names,
-        "skills_catalog_prompt": queen_skills_catalog,
-        "protocols_prompt": queen_protocols,
-        "skill_dirs": list(queen_skill_dirs),
-        "identity_prompt": "",
-        "memory_prompt": "",
-        "queen_phase": phase_state.phase if phase_state else "",
-        "queen_id": getattr(phase_state, "queen_id", "") if phase_state else "",
-        "loop_config": queen_lc_config,
-        "spawned_from": session.id,
-        "spawned_at": datetime.now(UTC).isoformat(),
-    }
-    # Concurrency advisory baked in at incubation time. Not enforced — the
-    # progress.db queue is atomic regardless — but the colony queen reads
-    # this when planning fan-outs (run_parallel_workers, trigger-fired
-    # batches) so behavior matches what the user agreed to during
-    # incubation.
-    if isinstance(concurrency_hint, int) and concurrency_hint > 0:
-        worker_meta["concurrency_hint"] = concurrency_hint
-    worker_config_path.write_text(json.dumps(worker_meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    worker_meta = build_meta(
+        worker_name=worker_name,
+        source_session_id=session.id,
+        task=task,
+        tool_names=tool_names,
+        skills_catalog_prompt=queen_skills_catalog,
+        protocols_prompt=queen_protocols,
+        skill_dirs=list(queen_skill_dirs),
+        queen_loop_config=queen_config,
+        queen_phase=phase_state.phase if phase_state else "",
+        queen_id=getattr(phase_state, "queen_id", "") if phase_state else "",
+        input_data=_worker_input_data,
+        concurrency_hint=concurrency_hint,
+    )
+    worker_config_path.write_text(
+        json.dumps(worker_meta, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
 
     # ── 2a. Materialize named worker profiles ────────────────────
     # Each named profile gets its own ``profiles/<name>/worker.json``
