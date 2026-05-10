@@ -1257,6 +1257,41 @@ def register_queen_lifecycle_tools(
                 "(workers will rely on execution context fallback): %s",
                 exc,
             )
+        # Prerequisite: if the queen created user tables in tracker.db
+        # (tables outside the protected _prefix), at least one must be
+        # registered for worker writes before we spawn. Without this,
+        # every worker tracker_upsert call fails with "table not registered".
+        if _tracker_db_path:
+            try:
+                import sqlite3 as _sqlite3
+
+                _con = _sqlite3.connect(str(_tracker_db_path))
+                try:
+                    _has_user_tables = bool(
+                        _con.execute(
+                            "SELECT COUNT(*) FROM sqlite_master "
+                            "WHERE type='table' AND name NOT LIKE '\\_%' ESCAPE '\\'"
+                        ).fetchone()[0]
+                    )
+                    if _has_user_tables:
+                        _row = _con.execute(
+                            "SELECT COUNT(*) FROM _tracker_registry"
+                        ).fetchone()
+                        _reg_count = int(_row[0]) if _row else 0
+                        if _reg_count == 0:
+                            return json.dumps({
+                                "error": (
+                                    "Tracker has user tables but none are registered "
+                                    "for worker writes. Call tracker_register_writable "
+                                    "for each table workers need to write to before "
+                                    "calling run_parallel_workers."
+                                ),
+                            })
+                finally:
+                    _con.close()
+            except Exception:
+                pass  # if we can't check, don't block — let it fail at upsert time
+
         _tracker_task_ids: list[str | None] = [None] * len(tasks)
         if _tracker_db_path:
             try:
