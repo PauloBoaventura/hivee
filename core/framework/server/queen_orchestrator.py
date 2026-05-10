@@ -534,26 +534,41 @@ async def create_queen(
     # call into to fan out parallel workers from the queen.
     session._queen_tools = queen_tools  # type: ignore[attr-defined]
     session._queen_tool_executor = queen_tool_executor  # type: ignore[attr-defined]
+    # Tool Library live-session reads need the registry, not just the flat
+    # tool list, so server-scoped defaults like @server:files-tools can
+    # expand correctly while a queen DM is active.
+    session._queen_tool_registry = queen_registry  # type: ignore[attr-defined]
 
     # ---- Partition tools by phase ------------------------------------
     independent_names = set(_QUEEN_INDEPENDENT_TOOLS)
     incubating_names = set(_QUEEN_INCUBATING_TOOLS)
     colony_names = set(_QUEEN_COLONY_TOOLS)
+    mcp_server_tools_map: dict[str, set[str]] = dict(getattr(queen_registry, "_mcp_server_tools", {}))
+    mcp_tool_names_all = set().union(*mcp_server_tools_map.values()) if mcp_server_tools_map else set()
 
     registered_names = {t.name for t in queen_tools}
     logger.info("Queen: registered tools: %s", sorted(registered_names))
 
-    phase_state.colony_tools = [t for t in queen_tools if t.name in colony_names]
-    # Incubating tool surface is intentionally minimal (read-only inspection
-    # + create_colony + cancel_incubation) — no MCP tools spliced in, so the
-    # queen stays focused on drafting the spec.
-    phase_state.incubating_tools = [t for t in queen_tools if t.name in incubating_names]
+    # Phase lists gate Hive lifecycle/system tools (create_colony,
+    # run_parallel_workers, trigger controls, etc.). User-configurable MCP
+    # tools should not disappear just because the queen changes phase, so
+    # MCP-origin tools (browser_*, web integrations, file tools, etc.) are
+    # appended to every phase and then filtered by the per-queen MCP allowlist.
+    mcp_tools = [t for t in queen_tools if t.name in mcp_tool_names_all]
 
-    # Independent phase gets core tools + all MCP tools not claimed by any
-    # other phase (files-tools file I/O, gcu-tools browser, etc.).
-    all_phase_names = independent_names | incubating_names | colony_names
-    mcp_tools = [t for t in queen_tools if t.name not in all_phase_names]
-    phase_state.independent_tools = [t for t in queen_tools if t.name in independent_names] + mcp_tools
+    def _phase_tools(system_names: set[str]) -> list:
+        seen: set[str] = set()
+        out = []
+        for tool in [t for t in queen_tools if t.name in system_names] + mcp_tools:
+            if tool.name in seen:
+                continue
+            seen.add(tool.name)
+            out.append(tool)
+        return out
+
+    phase_state.independent_tools = _phase_tools(independent_names)
+    phase_state.incubating_tools = _phase_tools(incubating_names)
+    phase_state.colony_tools = _phase_tools(colony_names)
     logger.info(
         "Queen: independent tools: %s",
         sorted(t.name for t in phase_state.independent_tools),
@@ -572,8 +587,7 @@ async def create_queen(
     # ``QueenPhaseState`` only gates MCP tools (lifecycle and synthetic
     # tools always pass through). Then apply the queen profile's stored
     # allowlist (if any) and memoize the filtered independent tool list.
-    mcp_server_tools_map: dict[str, set[str]] = dict(getattr(queen_registry, "_mcp_server_tools", {}))
-    phase_state.mcp_tool_names_all = set().union(*mcp_server_tools_map.values()) if mcp_server_tools_map else set()
+    phase_state.mcp_tool_names_all = mcp_tool_names_all
     # The queen's MCP tool allowlist now lives in a dedicated
     # ``tools.json`` sidecar next to ``profile.yaml``. ``load_queen_tools_config``
     # migrates any legacy ``enabled_mcp_tools`` field out of profile.yaml

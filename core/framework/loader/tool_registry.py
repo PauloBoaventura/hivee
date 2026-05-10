@@ -784,15 +784,28 @@ class ToolRegistry:
             # Reset the per-server library catalog before re-populating so
             # a re-register (e.g. credential resync) starts clean.
             self._mcp_full_catalog[server_name] = []
+            server_catalog_names: set[str] = set()
 
             count = 0
             admitted_names: list[str] = []
             for mcp_tool in client.list_tools():
-                # Populate the Tool Library catalog regardless of the
-                # strict credential gate so the UI can show greyed-out
-                # rows with a Connect button. The library_admit gate
-                # still drops the manifest sentinel and unverified tools.
-                if library_admit(mcp_tool.name):
+                origin_server = self._find_mcp_origin_server_for_tool(mcp_tool.name)
+                catalog_shadowed = (
+                    preserve_existing_tools
+                    and origin_server is not None
+                    and origin_server != server_name
+                )
+                # Populate the Tool Library catalog with the same logical
+                # first-wins identity as execution. Credentialed tools still
+                # appear before the user connects a provider, but duplicate
+                # tool names from later MCP servers do not produce duplicate
+                # rows/categories because allowlists and executors are keyed
+                # by tool name, not by (server, tool).
+                if (
+                    library_admit(mcp_tool.name)
+                    and mcp_tool.name not in server_catalog_names
+                    and not catalog_shadowed
+                ):
                     self._mcp_full_catalog[server_name].append(
                         {
                             "name": mcp_tool.name,
@@ -801,6 +814,7 @@ class ToolRegistry:
                             "provider": tool_provider_map.get(mcp_tool.name),
                         }
                     )
+                    server_catalog_names.add(mcp_tool.name)
                 if not admit(mcp_tool.name):
                     continue
                 if tool_cap is not None and count >= tool_cap:
@@ -808,7 +822,7 @@ class ToolRegistry:
 
                 if preserve_existing_tools and mcp_tool.name in self._tools:
                     if log_collisions:
-                        origin_server = self._find_mcp_origin_server_for_tool(mcp_tool.name) or "<existing>"
+                        origin_server = origin_server or "<existing>"
                         # Don't warn when a server is being re-registered
                         # by itself — that's a redundant-init case (e.g.
                         # the same tool_registry seeing the same server

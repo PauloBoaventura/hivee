@@ -345,15 +345,20 @@ or find files.
 _queen_tools_incubating = """
 # Tools (INCUBATING mode)
 
-You've been approved to fork. The full coding toolkit is gone on \
+You've been approved to fork. System lifecycle tools are narrowed on \
 purpose — your job in this phase is to nail the spec, not keep doing \
-work. Available:
+unbounded work. User-configured MCP tools (for example browser tools) \
+remain available when enabled in the Tool Library. Available:
 
 ## Read-only inspection (files-tools MCP)
 - read_file, search_files — for confirming details before \
 you commit (e.g. peek at an existing skill in ~/.hive/skills/, sanity-check \
 an API URL). search_files covers both grep (target='content') and ls/find \
 (target='files', glob like '*.py').
+
+## Configured MCP tools
+- Any enabled MCP tools not controlled by phase lifecycle gating remain \
+available here. Use them when they help settle the colony spec.
 
 ## Approved → operational checklist (use your judgement, ask only what's missing)
 The conversation that got you here probably did NOT cover all of:
@@ -504,11 +509,17 @@ them in that order.
   interval, or webhook to fire this colony again. New scope or \
   different work is a NEW colony, not a trigger here.
 
-## Read-only inspection
+## File inspection + direct fixes
 
 - ``read_file``, ``write_file``, ``edit_file``, ``search_files`` \
   (``search_files`` covers grep/find/ls via ``target='content'`` or \
   ``target='files'``).
+
+## Configured MCP tools
+
+- User-enabled MCP tools, including browser tools, remain available in \
+colony mode. They are controlled by the Tool Library allowlist, not by \
+the colony lifecycle phase.
 
 # Common mistakes to avoid
 

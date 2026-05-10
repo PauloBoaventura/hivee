@@ -285,12 +285,19 @@ class QueenPhaseState:
             len(self._filtered_independent_tools),
         )
 
+    def _filter_mcp_tools_for_phase(self, tools: list) -> list:
+        """Apply the user-configured MCP allowlist without gating lifecycle tools."""
+        if self.enabled_mcp_tools is None:
+            return list(tools)
+        allowed = set(self.enabled_mcp_tools)
+        return [t for t in tools if t.name not in self.mcp_tool_names_all or t.name in allowed]
+
     def get_current_tools(self) -> list:
         """Return tools for the current phase."""
         if self.phase == "colony":
-            return list(self.colony_tools)
+            return self._filter_mcp_tools_for_phase(self.colony_tools)
         if self.phase == "incubating":
-            return list(self.incubating_tools)
+            return self._filter_mcp_tools_for_phase(self.incubating_tools)
         # Default / "independent" — DM mode with full MCP tools, gated by
         # the per-queen allowlist. Return the memoized list directly so the
         # JSON sent to the LLM is byte-identical turn-to-turn.

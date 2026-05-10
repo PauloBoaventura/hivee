@@ -1,8 +1,8 @@
 """Tests for the per-queen MCP tool allowlist filter + routes.
 
 Covers:
-1. QueenPhaseState filter semantics (default-allow, allowlist, empty, phase-
-   isolation, memo identity for LLM prompt-cache stability).
+1. QueenPhaseState filter semantics (default-allow, allowlist, empty, all-
+   phase MCP filtering, memo identity for LLM prompt-cache stability).
 2. routes_queen_tools round trip (GET, PATCH, validation, live-session
    hot-reload).
 
@@ -66,20 +66,22 @@ class TestPhaseStateFilter:
         names = [t.name for t in ps.get_current_tools()]
         assert names == ["lc_c"]
 
-    def test_filter_isolated_to_independent_phase(self):
+    def test_allowlist_applies_to_mcp_tools_in_every_phase(self):
         ps = QueenPhaseState(phase="independent")
         ps.independent_tools = [_tool("mcp_a"), _tool("lc_c")]
-        ps.colony_tools = [_tool("mcp_a"), _tool("lc_c")]
+        ps.incubating_tools = [_tool("mcp_a"), _tool("lc_incubating")]
+        ps.colony_tools = [_tool("mcp_a"), _tool("lc_colony")]
         ps.mcp_tool_names_all = {"mcp_a"}
         ps.enabled_mcp_tools = []
         ps.rebuild_independent_filter()
 
-        # Independent → filtered
         assert [t.name for t in ps.get_current_tools()] == ["lc_c"]
 
-        # Other phases → unaffected
+        ps.phase = "incubating"
+        assert [t.name for t in ps.get_current_tools()] == ["lc_incubating"]
+
         ps.phase = "colony"
-        assert [t.name for t in ps.get_current_tools()] == ["mcp_a", "lc_c"]
+        assert [t.name for t in ps.get_current_tools()] == ["lc_colony"]
 
     def test_memo_returns_stable_identity_for_prompt_cache(self):
         """Same Python list object across turns → LLM prompt cache stays warm."""
@@ -266,6 +268,75 @@ async def test_get_tools_exposes_categories(queen_dir, monkeypatch):
     # @server:files-tools shorthand expanded against the catalog.
     assert "read_file" in cats["file_ops"]["tools"]
     assert "edit_file" in cats["file_ops"]["tools"]
+
+
+@pytest.mark.asyncio
+async def test_get_tools_live_session_preserves_server_scoped_defaults(queen_dir, monkeypatch):
+    """A live session must use registry server groups, not the flat fallback.
+
+    If the catalog collapses to ``{"MCP Tools": [...]}``, the
+    ``@server:files-tools`` role-default shorthand cannot expand and
+    file_ops degrades to only ``pdf_read``.
+    """
+    monkeypatch.setattr(routes_queen_tools, "ensure_default_queens", lambda: None)
+    _, queen_id = queen_dir  # queen_technology — has file_ops in role default
+
+    class _FakeRegistry:
+        _mcp_server_tools = {
+            "files-tools": {"read_file", "write_file", "edit_file", "search_files"},
+            "hive_tools": {"pdf_read"},
+        }
+
+        def get_full_mcp_catalog(self):
+            return {}
+
+        def get_tools(self):
+            return {
+                name: _tool(name)
+                for name in {
+                    "read_file",
+                    "write_file",
+                    "edit_file",
+                    "search_files",
+                    "pdf_read",
+                }
+            }
+
+    phase_state = QueenPhaseState(phase="independent")
+    phase_state.independent_tools = [
+        _tool("read_file"),
+        _tool("write_file"),
+        _tool("edit_file"),
+        _tool("search_files"),
+        _tool("pdf_read"),
+    ]
+    phase_state.mcp_tool_names_all = {
+        "read_file",
+        "write_file",
+        "edit_file",
+        "search_files",
+        "pdf_read",
+    }
+    session = _FakeSession(queen_name=queen_id, phase_state=phase_state)
+    session._queen_tool_registry = _FakeRegistry()
+    manager = _FakeManager(_sessions={"sess-1": session})
+
+    app = await _make_app(manager=manager)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get(f"/api/queen/{queen_id}/tools")
+        assert resp.status == 200
+        body = await resp.json()
+
+    enabled = set(body["enabled_mcp_tools"] or [])
+    assert {"read_file", "write_file", "edit_file", "search_files", "pdf_read"} <= enabled
+    cats = {c["name"]: c for c in body["categories"]}
+    assert cats["file_ops"]["tools"] == [
+        "edit_file",
+        "read_file",
+        "search_files",
+        "write_file",
+        "pdf_read",
+    ]
 
 
 def test_resolve_queen_default_tools_expands_server_shorthand():

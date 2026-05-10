@@ -210,6 +210,55 @@ def test_register_mcp_server_direct_client_when_manager_disabled(monkeypatch):
     assert created_clients[0].disconnect_calls == 1
 
 
+def test_full_mcp_catalog_omits_tools_shadowed_by_earlier_server(monkeypatch):
+    """The Tool Library catalog should mirror execution's first-wins names."""
+    registry = ToolRegistry()
+
+    class FakeClient:
+        def __init__(self, config):
+            self.config = config
+
+        def connect(self):
+            pass
+
+        def disconnect(self):
+            pass
+
+        def list_tools(self):
+            names = {
+                "files-tools": ["read_file", "write_file"],
+                "hive_tools": ["read_file", "write_file", "pdf_read"],
+            }[self.config.name]
+            return [
+                SimpleNamespace(
+                    name=name,
+                    description=name,
+                    input_schema={"type": "object", "properties": {}, "required": []},
+                )
+                for name in names
+            ]
+
+        def call_tool(self, tool_name, arguments):
+            return {"tool": tool_name, "arguments": arguments}
+
+    monkeypatch.setattr("framework.loader.mcp_client.MCPClient", FakeClient)
+
+    registry.register_mcp_server(
+        {"name": "files-tools", "transport": "stdio", "command": "echo"},
+        use_connection_manager=False,
+    )
+    registry.register_mcp_server(
+        {"name": "hive_tools", "transport": "stdio", "command": "echo"},
+        use_connection_manager=False,
+    )
+
+    catalog = registry.get_full_mcp_catalog()
+    assert [t["name"] for t in catalog["files-tools"]] == ["read_file", "write_file"]
+    assert [t["name"] for t in catalog["hive_tools"]] == ["pdf_read"]
+    assert registry.get_server_tool_names("files-tools") == {"read_file", "write_file"}
+    assert registry.get_server_tool_names("hive_tools") == {"pdf_read"}
+
+
 def test_load_registry_servers_retries_when_registration_returns_zero(monkeypatch):
     registry = ToolRegistry()
     attempts = {"count": 0}
