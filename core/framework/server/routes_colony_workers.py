@@ -12,10 +12,10 @@ Session-scoped (bound to a live session's runtime):
 - GET /api/sessions/{session_id}/colony/tools       — colony's default tools
 
 Colony-scoped (bound to the on-disk colony directory, independent of any
-live session — one colony has exactly one progress.db):
-- GET /api/colonies/{colony_name}/progress/snapshot — progress.db tasks/steps snapshot
+live session — one colony has exactly one tracker.db):
+- GET /api/colonies/{colony_name}/progress/snapshot — legacy progress snapshot
 - GET /api/colonies/{colony_name}/progress/stream   — SSE feed of upserts (polled)
-- GET /api/colonies/{colony_name}/data/tables       — list user tables in progress.db
+- GET /api/colonies/{colony_name}/data/tables       — list user tables in tracker.db
 - GET /api/colonies/{colony_name}/data/tables/{table}/rows — paginated rows
 - PATCH /api/colonies/{colony_name}/data/tables/{table}/rows — edit a row
 """
@@ -278,27 +278,23 @@ async def handle_list_colony_tools(request: web.Request) -> web.Response:
     return web.json_response({"tools": tools})
 
 
-# ── Progress DB (tasks/steps) ──────────────────────────────────────
+# ── Tracker DB progress snapshot (protected task tables) ───────────
 
-
-def _resolve_progress_db_by_name(colony_name: str) -> Path | None:
-    """Resolve a colony's progress.db path by directory name.
-
-    Returns ``None`` when the name fails validation or the file does not
-    exist. Both conditions render as an empty Data tab in the UI rather
-    than a hard error so an operator can open the panel before any
-    workers have actually run.
-    """
+def _resolve_tracker_db_by_name(colony_name: str) -> Path | None:
+    """Resolve a colony's tracker.db path by directory name."""
     if not _COLONY_NAME_RE.match(colony_name):
         return None
     from framework.config import COLONIES_DIR
+    from framework.host.tracker_db import ensure_tracker_db
 
-    db_path = COLONIES_DIR / colony_name / "data" / "progress.db"
-    return db_path if db_path.exists() else None
+    colony_dir = COLONIES_DIR / colony_name
+    if not colony_dir.is_dir():
+        return None
+    return ensure_tracker_db(colony_dir)
 
 
 def _read_progress_snapshot(db_path: Path, worker_id: str | None) -> dict:
-    """Read tasks + steps from progress.db, optionally filtered by worker_id.
+    """Read protected task tables from tracker.db when present.
 
     The worker_id filter applies to tasks (claimed by that worker) and
     to steps (executed by that worker). If omitted, returns all rows.
@@ -306,18 +302,36 @@ def _read_progress_snapshot(db_path: Path, worker_id: str | None) -> dict:
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
     try:
         con.row_factory = sqlite3.Row
+        # _list_user_tables intentionally hides protected tables, so ask
+        # sqlite_master directly for the framework-owned progress tables.
+        protected = {
+            r["name"]
+            for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('_tasks', '_steps')"
+            )
+        }
+        if "_tasks" not in protected:
+            return {"tasks": [], "steps": []}
         if worker_id:
             task_rows = con.execute(
-                "SELECT * FROM tasks WHERE worker_id = ? ORDER BY updated_at DESC",
+                "SELECT * FROM _tasks WHERE worker_id = ? ORDER BY updated_at DESC",
                 (worker_id,),
             ).fetchall()
-            step_rows = con.execute(
-                "SELECT * FROM steps WHERE worker_id = ? ORDER BY task_id, seq",
-                (worker_id,),
-            ).fetchall()
+            step_rows = (
+                con.execute(
+                    "SELECT * FROM _steps WHERE worker_id = ? ORDER BY task_id, seq",
+                    (worker_id,),
+                ).fetchall()
+                if "_steps" in protected
+                else []
+            )
         else:
-            task_rows = con.execute("SELECT * FROM tasks ORDER BY updated_at DESC LIMIT 500").fetchall()
-            step_rows = con.execute("SELECT * FROM steps ORDER BY task_id, seq LIMIT 2000").fetchall()
+            task_rows = con.execute("SELECT * FROM _tasks ORDER BY updated_at DESC LIMIT 500").fetchall()
+            step_rows = (
+                con.execute("SELECT * FROM _steps ORDER BY task_id, seq LIMIT 2000").fetchall()
+                if "_steps" in protected
+                else []
+            )
         return {
             "tasks": [dict(r) for r in task_rows],
             "steps": [dict(r) for r in step_rows],
@@ -332,7 +346,7 @@ async def handle_progress_snapshot(request: web.Request) -> web.Response:
     Optional ?worker_id=... to filter to rows touched by a specific worker.
     """
     colony_name = request.match_info["colony_name"]
-    db_path = _resolve_progress_db_by_name(colony_name)
+    db_path = _resolve_tracker_db_by_name(colony_name)
     if db_path is None:
         return web.json_response({"tasks": [], "steps": []})
 
@@ -354,16 +368,24 @@ def _read_progress_upserts(
     without either timestamp hasn't changed since the last poll and is
     skipped.
 
-    ``since`` is an ISO8601 string (as produced by progress_db._now_iso).
+    ``since`` is an ISO8601 string.
     ``None`` means "give me everything" — used for the SSE priming frame.
     """
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
     try:
         con.row_factory = sqlite3.Row
-        task_sql = "SELECT * FROM tasks"
+        protected = {
+            r["name"]
+            for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('_tasks', '_steps')"
+            )
+        }
+        if "_tasks" not in protected:
+            return [], [], since
+        task_sql = "SELECT * FROM _tasks"
         step_sql = (
             "SELECT *, COALESCE(completed_at, started_at) AS _ts "
-            "FROM steps WHERE COALESCE(completed_at, started_at) IS NOT NULL"
+            "FROM _steps WHERE COALESCE(completed_at, started_at) IS NOT NULL"
         )
         task_args: list = []
         step_args: list = []
@@ -382,7 +404,7 @@ def _read_progress_upserts(
         step_sql += " ORDER BY _ts"
 
         task_rows = con.execute(task_sql, task_args).fetchall()
-        step_rows = con.execute(step_sql, step_args).fetchall()
+        step_rows = con.execute(step_sql, step_args).fetchall() if "_steps" in protected else []
 
         tasks = [dict(r) for r in task_rows]
         steps = [dict(r) for r in step_rows]
@@ -423,10 +445,10 @@ async def handle_progress_stream(request: web.Request) -> web.StreamResponse:
         payload = f"event: {event}\ndata: {json.dumps(data)}\n\n"
         await resp.write(payload.encode("utf-8"))
 
-    db_path = _resolve_progress_db_by_name(colony_name)
+    db_path = _resolve_tracker_db_by_name(colony_name)
     if db_path is None:
         await _send("snapshot", {"tasks": [], "steps": []})
-        await _send("end", {"reason": "no_progress_db"})
+        await _send("end", {"reason": "no_tracker_db"})
         return resp
 
     try:
@@ -466,7 +488,7 @@ async def handle_progress_stream(request: web.Request) -> web.StreamResponse:
     return resp
 
 
-# ── Raw data grid (airtable-style view/edit of progress.db tables) ─────
+# ── Raw data grid (airtable-style view/edit of tracker.db tables) ─────
 #
 # The Data tab lets the operator inspect and hand-edit SQLite rows.
 # Identifier-quoting note: SQLite params can only bind values, never
@@ -486,7 +508,11 @@ def _list_user_tables(con: sqlite3.Connection) -> list[str]:
     return [
         r["name"]
         for r in con.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%' "
+            "AND name NOT LIKE '\\_%' ESCAPE '\\' "
+            "ORDER BY name"
         )
     ]
 
@@ -624,7 +650,7 @@ def _update_table_row(
 async def handle_list_tables(request: web.Request) -> web.Response:
     """GET /api/colonies/{colony_name}/data/tables"""
     colony_name = request.match_info["colony_name"]
-    db_path = _resolve_progress_db_by_name(colony_name)
+    db_path = _resolve_tracker_db_by_name(colony_name)
     if db_path is None:
         return web.json_response({"tables": []})
     tables = await asyncio.to_thread(_read_tables_overview, db_path)
@@ -634,9 +660,9 @@ async def handle_list_tables(request: web.Request) -> web.Response:
 async def handle_table_rows(request: web.Request) -> web.Response:
     """GET /api/colonies/{colony_name}/data/tables/{table}/rows"""
     colony_name = request.match_info["colony_name"]
-    db_path = _resolve_progress_db_by_name(colony_name)
+    db_path = _resolve_tracker_db_by_name(colony_name)
     if db_path is None:
-        return web.json_response({"error": "no progress.db"}, status=404)
+        return web.json_response({"error": "no tracker.db"}, status=404)
 
     table = request.match_info["table"]
     # Clamp limit: 500 is enough for the grid's virtualization window;
@@ -661,9 +687,9 @@ async def handle_update_row(request: web.Request) -> web.Response:
     Body: ``{"pk": {col: value, ...}, "updates": {col: value, ...}}``.
     """
     colony_name = request.match_info["colony_name"]
-    db_path = _resolve_progress_db_by_name(colony_name)
+    db_path = _resolve_tracker_db_by_name(colony_name)
     if db_path is None:
-        return web.json_response({"error": "no progress.db"}, status=404)
+        return web.json_response({"error": "no tracker.db"}, status=404)
 
     try:
         body = await request.json()
@@ -687,7 +713,7 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get("/api/sessions/{session_id}/workers", handle_list_workers)
     app.router.add_get("/api/sessions/{session_id}/colony/skills", handle_list_colony_skills)
     app.router.add_get("/api/sessions/{session_id}/colony/tools", handle_list_colony_tools)
-    # Colony-scoped — one progress.db per colony, no session indirection.
+    # Colony-scoped — one tracker.db per colony, no session indirection.
     app.router.add_get(
         "/api/colonies/{colony_name}/progress/snapshot",
         handle_progress_snapshot,

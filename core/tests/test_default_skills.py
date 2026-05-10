@@ -20,7 +20,7 @@ class TestDefaultSkillFiles:
     """Verify all built-in SKILL.md files parse correctly."""
 
     def test_all_skills_exist(self):
-        assert len(SKILL_REGISTRY) == 6
+        assert len(SKILL_REGISTRY) == 5
 
     @pytest.mark.parametrize("skill_name,dir_name", list(SKILL_REGISTRY.items()))
     def test_skill_parses(self, skill_name, dir_name):

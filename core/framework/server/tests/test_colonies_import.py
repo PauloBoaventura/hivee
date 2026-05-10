@@ -248,7 +248,7 @@ async def test_multi_root_unpacks_three_subtrees(colonies_dir: Path) -> None:
         {
             "colonies/x_daily/": None,
             "colonies/x_daily/metadata.json": b'{"queen_session_id":"session_x"}',
-            "colonies/x_daily/data/progress.db": b"sqlite",
+            "colonies/x_daily/data/tracker.db": b"sqlite",
             "agents/x_daily/worker/": None,
             "agents/x_daily/worker/conversations/": None,
             "agents/x_daily/worker/conversations/0001.json": b'{"role":"user"}',
@@ -263,7 +263,7 @@ async def test_multi_root_unpacks_three_subtrees(colonies_dir: Path) -> None:
         body = await resp.json()
     # Colony files
     assert (colonies_dir / "x_daily" / "metadata.json").exists()
-    assert (colonies_dir / "x_daily" / "data" / "progress.db").exists()
+    assert (colonies_dir / "x_daily" / "data" / "tracker.db").exists()
     # Worker conversations under HIVE_HOME/agents/<colony>/worker/
     hive_home = colonies_dir.parent
     assert (

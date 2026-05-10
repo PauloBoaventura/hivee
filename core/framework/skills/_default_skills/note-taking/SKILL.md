@@ -11,7 +11,7 @@ metadata:
 
 Maintain free-form working notes in shared buffer key `_working_notes` for data that *you* need to remember but that isn't captured by the colony task queue.
 
-**Do not duplicate the queue in here.** Per-task goal, ordered steps, and SOP gates live in `progress.db` — use `hive.colony-progress-tracker` for those. These notes are for things the DB schema doesn't cover.
+**Do not duplicate tracker state in here.** Per-row status, structured results, and review fields live in `tracker.db` via `tracker_upsert`. These notes are for things the DB schema doesn't cover.
 
 Update at these checkpoints:
 

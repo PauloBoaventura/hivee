@@ -381,13 +381,9 @@ is_logged_in = browser_evaluate("""
 
 ## Deduplication pattern
 
-Dedup is handled by the colony progress queue, not a separate JSON file. For any daily loop (connection acceptance, profile visits, DMs), the queen enqueues one row in the `tasks` table per `(profile_url, action)` pair; workers claim, act, and mark done. Already-`done` rows are skipped on the next claim — that's your crash-resume and cross-day dedup. See `hive.colony-progress-tracker` for the full claim/update protocol.
+Dedup is handled by a queen-owned tracker table, not a separate JSON file. For any daily loop (connection acceptance, profile visits, DMs), use a stable key such as `(profile_url, action)` and let workers record status with `tracker_upsert`.
 
-If you need to check whether a given `(profile_url, action)` has already been handled in a prior run before enqueuing a new row, query the queue directly:
-
-```bash
-sqlite3 "<db_path>" "SELECT status FROM tasks WHERE payload LIKE '%\"profile_url\":\"<url>\"%' AND payload LIKE '%\"action\":\"<action>\"%';"
-```
+If you need to check whether a given `(profile_url, action)` has already been handled in a prior run, query the tracker table with `tracker_query`.
 
 Empty → not yet enqueued, safe to add. Otherwise honor the existing row's status.
 

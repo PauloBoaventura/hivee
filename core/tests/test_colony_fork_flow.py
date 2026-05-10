@@ -348,10 +348,9 @@ async def test_colony_spawn_creates_correct_artifacts(tmp_path, monkeypatch):
     assert worker_meta["loop_config"]["max_iterations"] == 42
     assert worker_meta["loop_config"]["max_tool_calls_per_turn"] == 7
 
-    # input_data carries both DB paths so the worker can find the queue
-    # (progress.db) and the queen-owned tracker (tracker.db) without
-    # guessing colony layout.
-    assert worker_meta["input_data"]["db_path"].endswith("/progress.db")
+    # input_data carries the queen-owned tracker path without guessing
+    # colony layout.
+    assert "db_path" not in worker_meta["input_data"]
     assert worker_meta["input_data"]["tracker_db_path"].endswith("/tracker.db")
     assert worker_meta["input_data"]["colony_id"] == "honeycomb"
     # tracker.db actually exists on disk after the fork.

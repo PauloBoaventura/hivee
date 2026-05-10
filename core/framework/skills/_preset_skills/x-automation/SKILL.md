@@ -203,7 +203,7 @@ for c in candidates:
     else:
         browser_click("[data-testid='tweetButton']")
         sleep(2)
-        # Mark the task done in progress.db — see hive.colony-progress-tracker
+        # Record the reply status via tracker_upsert
 
     # Close the composer (press Escape or click the Close button)
     browser_press("Escape")
@@ -307,7 +307,7 @@ If any of these appear, **stop the run, screenshot the state, and surface the is
 
 ## Deduplication pattern
 
-Dedup is handled by the colony progress queue, not a separate JSON file. The queen enqueues one row in the `tasks` table per reply target (keyed by tweet URL); workers claim, reply, and mark done. Already-`done` rows are skipped on the next claim — that's your crash-resume and cross-day dedup, for free. See `hive.colony-progress-tracker` for the full claim/update protocol.
+Dedup is handled by a queen-owned tracker table, not a separate JSON file. Use a stable key such as tweet URL and let workers record status with `tracker_upsert`.
 
 Extract the tweet URL via `browser_evaluate` so the queen can use it as the task key:
 
@@ -322,11 +322,7 @@ url = browser_evaluate("""
 """, article_index)
 ```
 
-If you need to check whether a given tweet URL has already been replied to in a prior run (e.g., scanning live search results before enqueuing), query the queue directly:
-
-```bash
-sqlite3 "<db_path>" "SELECT status FROM tasks WHERE payload LIKE '%\"tweet_url\":\"<url>\"%';"
-```
+If you need to check whether a given tweet URL has already been replied to in a prior run, query the tracker table with `tracker_query`.
 
 Empty → not yet enqueued, safe to add. Otherwise honor the existing row's status.
 

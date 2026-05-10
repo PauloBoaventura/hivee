@@ -148,26 +148,9 @@ class SessionManager:
         except Exception:
             logger.warning("v2 migration failed (non-fatal)", exc_info=True)
 
-        # Ensure every existing colony has an up-to-date progress.db
-        # (schema v1, WAL mode) and reclaim any stale claims left behind
-        # by crashed workers from the previous run.  Idempotent and
-        # fast; runs synchronously because the event loop hasn't
-        # started yet at __init__ time.
-        from framework.host.progress_db import ensure_all_colony_dbs
-
-        try:
-            ensured = ensure_all_colony_dbs()
-            if ensured:
-                logger.info("progress_db: ensured %d colony DB(s) at startup", len(ensured))
-        except Exception:
-            logger.warning("progress_db: backfill at startup failed (non-fatal)", exc_info=True)
-
-        # Same backfill, but for tracker.db — the queen-owned domain DB
-        # introduced after progress.db. Older colonies don't have one yet;
-        # this creates it (empty bootstrap schema) and patches their
-        # worker configs with ``tracker_db_path``. Independent of the
-        # progress_db block: failure here must not break startup, and
-        # success there shouldn't gate this.
+        # Ensure every existing colony has tracker.db and patch worker
+        # configs with ``tracker_db_path``. ProgressDB is no longer part
+        # of the active worker context.
         from framework.host.tracker_db import ensure_all_colony_tracker_dbs
 
         try:

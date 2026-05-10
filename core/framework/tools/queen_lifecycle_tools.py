@@ -71,7 +71,7 @@ _INCUBATING_APPROVAL_GUIDANCE = (
     "ambiguous for THIS colony — for example: how many worker processes "
     "should run in parallel (e.g. 1 for a digest, 5 for a fan-out), what "
     "schedule fits (cron, interval), what should the worker write into "
-    "progress tracking(progress.db) so the user "
+    "tracker tables so the user "
     "can review results later, how to handle partial failures, what "
     "credentials or MCP servers the worker needs that you haven't "
     "discussed. You don't "
@@ -1231,59 +1231,65 @@ def register_queen_lifecycle_tools(
                 len(queen_tool_names) if queen_tool_names is not None else "n/a",
             )
 
-        # Colony progress tracker wiring: if the session's loaded
-        # worker points at a colony directory that has a progress.db,
-        # inject db_path + colony_id into every per-task ``data``
-        # dict so each spawned worker sees them in its first user
-        # message and can claim rows from the queue. ColonyRuntime.
-        # spawn() detects db_path in input_data and pre-activates
-        # hive.colony-progress-tracker into the catalog prompt.
-        _colony_db_path: str | None = None
+        # TrackerDB context wiring: pass an explicit tracker_db_path to
+        # every worker so tracker tools do not infer paths from stale
+        # session.worker_path / colony_id state.
+        _tracker_db_path: str | None = None
         _colony_id: str | None = None
-        _worker_path = getattr(session, "worker_path", None)
-        if _worker_path:
-            from pathlib import Path as _Path
+        try:
+            from framework.config import COLONIES_DIR
+            from framework.host.tracker_db import ensure_tracker_db as _ensure_tracker_db
 
-            _wp = _Path(_worker_path)
-            _pdb = _wp / "data" / "progress.db"
-            if _pdb.exists():
-                _colony_db_path = str(_pdb.resolve())
-                _colony_id = _wp.name
-
-        # Phase 2: enqueue each task into progress.db BEFORE building
-        # spawn specs so every parallel worker has a pre-assigned row
-        # to claim. Without this the queue stays empty and each
-        # worker's claim UPDATE affects zero rows, silently falling
-        # back to executing from its spawn message.
-        _enqueued_task_ids: list[str | None] = [None] * len(tasks)
-        if _colony_db_path:
-            from pathlib import Path as _PathP
-
-            from framework.host.progress_db import (
-                enqueue_task as _enqueue_task_fn,
+            _colony_id = (
+                getattr(colony, "colony_name", None)
+                or getattr(session, "colony_name", None)
+                or getattr(colony, "colony_id", None)
+                or getattr(session, "colony_id", None)
             )
+            if _colony_id:
+                _cdir = COLONIES_DIR / str(_colony_id)
+                _tracker_db_path = str(
+                    (await asyncio.to_thread(_ensure_tracker_db, _cdir)).resolve()
+                )
+        except Exception as exc:
+            logger.warning(
+                "run_parallel_workers: failed to resolve tracker_db_path "
+                "(workers will rely on execution context fallback): %s",
+                exc,
+            )
+        _tracker_task_ids: list[str | None] = [None] * len(tasks)
+        if _tracker_db_path:
+            try:
+                from pathlib import Path as _PathT
 
-            _pdb_path_obj = _PathP(_colony_db_path)
-            for _i, _spec in enumerate(tasks):
-                if not isinstance(_spec, dict):
-                    continue
-                _task_text_pre = str(_spec.get("task", "")).strip()
-                if not _task_text_pre:
-                    continue
-                try:
-                    _enqueued_task_ids[_i] = await asyncio.to_thread(
-                        _enqueue_task_fn,
-                        _pdb_path_obj,
+                from framework.host.tracker_db import (
+                    enqueue_framework_task as _enqueue_tracker_task,
+                )
+
+                _tracker_path_obj = _PathT(_tracker_db_path)
+                for _i, _spec in enumerate(tasks):
+                    if not isinstance(_spec, dict):
+                        continue
+                    _task_text_pre = str(_spec.get("task", "")).strip()
+                    if not _task_text_pre:
+                        continue
+                    _tracker_task_ids[_i] = await asyncio.to_thread(
+                        _enqueue_tracker_task,
+                        _tracker_path_obj,
                         _task_text_pre,
+                        payload=(
+                            _spec.get("data")
+                            if isinstance(_spec.get("data"), dict)
+                            else None
+                        ),
                         source="run_parallel_workers",
                     )
-                except Exception as _enqueue_exc:
-                    logger.warning(
-                        "run_parallel_workers: failed to enqueue tasks[%d] "
-                        "(spawn proceeding without pinned task_id): %s",
-                        _i,
-                        _enqueue_exc,
-                    )
+            except Exception as exc:
+                logger.warning(
+                    "run_parallel_workers: failed to record tracker task rows "
+                    "(spawn proceeding without task_id): %s",
+                    exc,
+                )
 
         # Normalise: each entry must have a non-empty "task" string.
         normalised: list[dict] = []
@@ -1294,14 +1300,14 @@ def register_queen_lifecycle_tools(
             if not task_text:
                 return json.dumps({"error": f"tasks[{i}].task is empty"})
             spec_data = spec.get("data") if isinstance(spec.get("data"), dict) else {}
-            if _colony_db_path:
+            if _tracker_db_path:
                 spec_data = {
                     **spec_data,
-                    "db_path": _colony_db_path,
+                    "tracker_db_path": _tracker_db_path,
                     "colony_id": _colony_id,
                 }
-                if _enqueued_task_ids[i]:
-                    spec_data["task_id"] = _enqueued_task_ids[i]
+                if _tracker_task_ids[i]:
+                    spec_data["task_id"] = _tracker_task_ids[i]
             entry: dict[str, Any] = {
                 "task": task_text,
                 "data": spec_data or None,
@@ -1328,13 +1334,11 @@ def register_queen_lifecycle_tools(
                 entry["loop_config_overrides"] = per_task_loop
             normalised.append(entry)
 
-        if _colony_db_path:
-            _pinned = sum(1 for tid in _enqueued_task_ids if tid)
+        if _tracker_db_path:
             logger.info(
-                "run_parallel_workers: attached progress_db context to %d spawn(s) (colony_id=%s, %d pinned task_ids)",
+                "run_parallel_workers: attached tracker_db context to %d spawn(s) (colony_id=%s)",
                 len(normalised),
                 _colony_id,
-                _pinned,
             )
 
         # Publish a colony template entry per task BEFORE spawning so
@@ -2040,12 +2044,9 @@ def register_queen_lifecycle_tools(
         the colony, and calling create_colony with an existing name
         means "my latest content wins."
 
-        When *tasks* is provided, each entry is seeded into the
-        colony's ``progress.db`` task queue in a single transaction.
-        Workers then claim rows from the queue using the
-        ``hive.colony-progress-tracker`` default skill. Each task dict
-        accepts: ``goal`` (required), optional ``steps``,
-        ``sop_items``, ``priority``, ``payload``, ``parent_task_id``.
+        For fan-out work, model the rows in tracker.db, register the
+        worker-writable columns, then call run_parallel_workers with
+        per-worker row keys and an attached protocol skill.
         """
         if session is None:
             return json.dumps({"error": "No session bound to this tool registry."})
@@ -2320,8 +2321,7 @@ def register_queen_lifecycle_tools(
                 "skill_installed": str(installed_skill),
                 "skill_name": installed_skill.name if installed_skill else None,
                 "skill_replaced": skill_replaced,
-                "db_path": fork_result.get("db_path"),
-                "tasks_seeded": len(fork_result.get("task_ids") or []),
+                "tracker_db_path": fork_result.get("tracker_db_path"),
                 # Transcript compaction runs in the background; opening
                 # the colony blocks on this marker until it finishes.
                 "compaction_status": fork_result.get("compaction_status", "skipped"),
@@ -2469,20 +2469,11 @@ def register_queen_lifecycle_tools(
                 "tasks": {
                     "type": "array",
                     "description": (
-                        "Optional pre-seeded task queue for the colony. "
-                        "When the colony is a fan-out of many similar "
-                        "units of work (e.g. 'process record #1234', "
-                        "'scrape profile X'), pass them here as an "
-                        "array and workers will claim rows atomically "
-                        "from the SQLite queue using the "
-                        "hive.colony-progress-tracker skill. Each task "
-                        "needs a 'goal' string; optionally include "
-                        "'steps' (ordered subtasks), 'sop_items' "
-                        "(required checklist gates), 'priority' "
-                        "(higher runs first), and 'payload' "
-                        "(task-specific parameters). Can be hundreds "
-                        "or thousands of entries — the bulk insert "
-                        "runs in a single transaction."
+                        "Deprecated legacy task queue input. Model fan-out "
+                        "work in tracker.db instead: create/seed a table "
+                        "with tracker_sql, open columns with "
+                        "tracker_register_writable, then call "
+                        "run_parallel_workers with row-key slices."
                     ),
                     "items": {
                         "type": "object",
@@ -2963,7 +2954,7 @@ def register_queen_lifecycle_tools(
         priority: int = 0,
         parent_task_id: str | None = None,
     ) -> str:
-        """Append a single task to an existing colony's progress.db queue.
+        """Append a single task to an existing colony's tracker task table.
 
         Use this when the colony is already created and more work
         needs to be fanned out (webhook-driven, follow-up requests,
@@ -2975,9 +2966,9 @@ def register_queen_lifecycle_tools(
             return json.dumps({"error": "colony_name must be lowercase alphanumeric with underscores"})
 
         from framework.config import COLONIES_DIR as _COLONIES_DIR
-        from framework.host.progress_db import (
-            enqueue_task as _enqueue_task,
-            ensure_progress_db as _ensure_db,
+        from framework.host.tracker_db import (
+            enqueue_framework_task as _enqueue_task,
+            ensure_tracker_db as _ensure_db,
         )
 
         colony_dir = _COLONIES_DIR / cn
@@ -2985,16 +2976,15 @@ def register_queen_lifecycle_tools(
             return json.dumps({"error": f"colony '{cn}' not found"})
 
         try:
-            db_path = await asyncio.to_thread(_ensure_db, colony_dir)
+            tracker_db_path = await asyncio.to_thread(_ensure_db, colony_dir)
             task_id = await asyncio.to_thread(
                 _enqueue_task,
-                db_path,
+                tracker_db_path,
                 goal,
-                steps=steps,
-                sop_items=sop_items,
                 payload=payload,
                 priority=priority,
                 parent_task_id=parent_task_id,
+                source="enqueue_task",
             )
         except Exception as e:
             logger.exception("enqueue_task: failed to insert row")
@@ -3005,21 +2995,18 @@ def register_queen_lifecycle_tools(
                 "status": "enqueued",
                 "colony_name": cn,
                 "task_id": task_id,
-                "db_path": str(db_path),
+                "tracker_db_path": str(tracker_db_path),
             }
         )
 
     _enqueue_task_tool = Tool(
         name="enqueue_task",
         description=(
-            "Append a single task to an existing colony's progress.db "
-            "queue. Use this after create_colony when more work needs "
+            "Append a single task to an existing colony's tracker.db "
+            "protected task table. Use this after create_colony when more work needs "
             "to be fanned out — e.g. a webhook fired, the user asked "
             "for a follow-up run, or a worker spawned a subtask. The "
-            "colony's workers pick it up on their next claim cycle "
-            "(atomic UPDATE … WHERE status='pending'). For bulk "
-            "authoring at colony creation time, pass the 'tasks' "
-            "array to create_colony instead."
+            "runtime records the task in TrackerDB."
         ),
         parameters={
             "type": "object",

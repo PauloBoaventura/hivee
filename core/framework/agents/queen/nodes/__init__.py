@@ -365,8 +365,8 @@ The conversation that got you here probably did NOT cover all of:
 - Concurrency: how many tasks should run in parallel? Single-fire?
 - Schedule: cron expression, interval (every N minutes), webhook, \
   manual-only?
-- Result tracking: what should the worker write into ``progress.db`` so \
-  the user can review later? Per-task status, summary, raw payload?
+- Result tracking: what tracker table(s) should workers write so the \
+  user can review later? Per-row status, summary, raw payload?
 - Failure handling: retry, alert, mark-failed-and-continue?
 - Credentials and MCP servers: what does the worker need that you \
   haven't discussed (API keys, OAuth, browser profile)?

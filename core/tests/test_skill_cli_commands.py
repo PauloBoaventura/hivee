@@ -355,7 +355,7 @@ class TestJsonFlag:
         data = json.loads(out)
         assert result == 0
         assert "skills" in data
-        assert len(data["skills"]) == 6  # 6 framework default skills
+        assert len(data["skills"]) == 5  # 5 framework default skills
         assert data["total_errors"] == 0
 
     def test_search_json_registry_unavailable_exits_1(self, capsys):

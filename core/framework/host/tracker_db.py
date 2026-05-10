@@ -1,20 +1,12 @@
 """Per-colony tracker DB: queen-owned domain model with raw-SQL freedom.
 
 Every colony gets its own ``tracker.db`` under
-``~/.hive/colonies/{name}/data/`` (next to ``progress.db``). The queen
-designs the schema with full SQL via ``execute_sql`` (denylist enforced).
-Workers fill rows through a narrower ``tracker_upsert`` tool, gated by
-the ``_tracker_registry`` table.
+``~/.hive/colonies/{name}/data/``. The queen designs the schema with
+full SQL via ``execute_sql`` (denylist enforced). Workers fill rows
+through a narrower ``tracker_upsert`` tool, gated by the
+``_tracker_registry`` table.
 
-Why a separate DB from ``progress.db``?
-``progress.db`` is the framework-owned task queue (atomic claim, stale
-reclamation, fixed schema). ``tracker.db`` is the queen's domain model —
-arbitrary tables, columns, and indexes that describe the *goal*, not the
-work. Keeping the two files separate means the framework can evolve
-``progress.db`` without touching what the queen wrote, and the queen has
-DDL freedom without risking the queue's invariants.
-
-Concurrency mirrors ``progress.db``:
+Concurrency:
 - WAL mode on day one.
 - Workers/queen open a fresh connection per call (``sqlite3`` CLI for
   agents, ``_connect`` for framework code).
@@ -36,13 +28,14 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Bootstrap schema. Only framework-owned tables; everything else is the
 # queen's. ``_tracker_registry`` is what gates ``tracker_upsert`` for
@@ -61,6 +54,66 @@ CREATE TABLE IF NOT EXISTS _tracker_meta (
     value           TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS _tasks (
+    id              TEXT PRIMARY KEY,
+    seq             INTEGER,
+    priority        INTEGER NOT NULL DEFAULT 0,
+    goal            TEXT NOT NULL,
+    payload         TEXT,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    worker_id       TEXT,
+    claim_token     TEXT,
+    claimed_at      TEXT,
+    started_at      TEXT,
+    completed_at    TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    retry_count     INTEGER NOT NULL DEFAULT 0,
+    max_retries     INTEGER NOT NULL DEFAULT 3,
+    last_error      TEXT,
+    parent_task_id  TEXT REFERENCES _tasks(id) ON DELETE SET NULL,
+    source          TEXT
+);
+
+CREATE TABLE IF NOT EXISTS _steps (
+    id              TEXT PRIMARY KEY,
+    task_id         TEXT NOT NULL REFERENCES _tasks(id) ON DELETE CASCADE,
+    seq             INTEGER NOT NULL,
+    title           TEXT NOT NULL,
+    detail          TEXT,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    evidence        TEXT,
+    worker_id       TEXT,
+    started_at      TEXT,
+    completed_at    TEXT,
+    UNIQUE (task_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS _sop_checklist (
+    id              TEXT PRIMARY KEY,
+    task_id         TEXT NOT NULL REFERENCES _tasks(id) ON DELETE CASCADE,
+    key             TEXT NOT NULL,
+    description     TEXT NOT NULL,
+    required        INTEGER NOT NULL DEFAULT 1,
+    done_at         TEXT,
+    done_by         TEXT,
+    note            TEXT,
+    UNIQUE (task_id, key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tracker_tasks_claimable
+    ON _tasks(status, priority DESC, seq, created_at)
+    WHERE status = 'pending';
+
+CREATE INDEX IF NOT EXISTS idx_tracker_steps_task_seq
+    ON _steps(task_id, seq);
+
+CREATE INDEX IF NOT EXISTS idx_tracker_sop_required_open
+    ON _sop_checklist(task_id, required, done_at);
+
+CREATE INDEX IF NOT EXISTS idx_tracker_tasks_status
+    ON _tasks(status, updated_at);
 """
 
 _PRAGMAS = (
@@ -151,11 +204,9 @@ def ensure_tracker_db(colony_dir: Path) -> Path:
 def _patch_worker_configs(colony_dir: Path, tracker_db_path: Path) -> int:
     """Inject ``input_data.tracker_db_path`` into existing ``worker.json`` files.
 
-    Mirror of ``framework.host.progress_db._patch_worker_configs``: runs on
-    every ``ensure_tracker_db`` call so colonies forked before this feature
-    landed get the tracker path threaded into their worker spawn message
-    on the next colony-runtime spin-up. Idempotent — files where
-    ``tracker_db_path`` already matches are not rewritten.
+    Runs on every ``ensure_tracker_db`` call so worker configs always
+    point at TrackerDB only. Legacy ProgressDB fields are removed so stale
+    ``db_path`` values cannot activate outdated worker protocols.
 
     Returns the number of files modified.
     """
@@ -163,7 +214,7 @@ def _patch_worker_configs(colony_dir: Path, tracker_db_path: Path) -> int:
     patched = 0
 
     for worker_cfg in colony_dir.glob("*.json"):
-        # Same shape filter as progress_db: skip colony-level files.
+        # Skip colony-level files.
         if worker_cfg.name in ("metadata.json", "triggers.json"):
             continue
         try:
@@ -177,10 +228,17 @@ def _patch_worker_configs(colony_dir: Path, tracker_db_path: Path) -> int:
         if not isinstance(input_data, dict):
             input_data = {}
 
-        if input_data.get("tracker_db_path") == abs_path:
+        changed = False
+        if input_data.get("tracker_db_path") != abs_path:
+            input_data["tracker_db_path"] = abs_path
+            changed = True
+        for legacy_key in ("db_path", "colony_data_dir"):
+            if legacy_key in input_data:
+                input_data.pop(legacy_key, None)
+                changed = True
+        if not changed:
             continue  # already patched
 
-        input_data["tracker_db_path"] = abs_path
         data["input_data"] = input_data
 
         try:
@@ -206,8 +264,7 @@ def ensure_all_colony_tracker_dbs(colonies_root: Path | None = None) -> list[Pat
     """Idempotently ensure every existing colony has a tracker.db.
 
     Called on framework host startup to backfill colonies that were
-    forked before this feature landed. Mirrors
-    :func:`framework.host.progress_db.ensure_all_colony_dbs`.
+    forked before TrackerDB landed.
     """
     if colonies_root is None:
         from framework.config import COLONIES_DIR
@@ -227,6 +284,59 @@ def ensure_all_colony_tracker_dbs(colonies_root: Path | None = None) -> list[Pat
                 "tracker_db: failed to ensure DB for colony '%s': %s", entry.name, e
             )
     return initialized
+
+
+def enqueue_framework_task(
+    db_path: Path,
+    goal: str,
+    *,
+    payload: Any = None,
+    priority: int = 0,
+    parent_task_id: str | None = None,
+    source: str | None = None,
+) -> str:
+    """Append a framework task row to tracker.db protected tables.
+
+    This replaces the old ProgressDB queue write path. It is framework
+    code, not a queen/worker SQL surface, so it may mutate ``_*`` tables.
+    """
+    task_id = str(uuid.uuid4())
+    now = _now_iso()
+    payload_text = None if payload is None else json.dumps(payload, ensure_ascii=False)
+    con = _connect(Path(db_path))
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM _tasks").fetchone()
+        seq = int(row[0] or 1)
+        con.execute(
+            """
+            INSERT INTO _tasks (
+                id, seq, priority, goal, payload, status, created_at,
+                updated_at, parent_task_id, source
+            ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                seq,
+                int(priority),
+                goal,
+                payload_text,
+                now,
+                now,
+                parent_task_id,
+                source,
+            ),
+        )
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    finally:
+        con.close()
+    return task_id
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +687,7 @@ __all__ = [
     "PROTECTED_PREFIX",
     "ensure_all_colony_tracker_dbs",
     "ensure_tracker_db",
+    "enqueue_framework_task",
     "execute_sql",
     "validate_sql",
 ]

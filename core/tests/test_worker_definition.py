@@ -99,23 +99,20 @@ class TestDefaultLoopConfig:
 
 
 class TestBuildInputData:
-    def test_carries_both_db_paths_and_colony_id(self) -> None:
+    def test_carries_tracker_db_path_and_colony_id(self) -> None:
         data = build_input_data(
-            db_path="/c/data/progress.db",
             tracker_db_path="/c/data/tracker.db",
             colony_id="colony_x",
         )
-        assert data["db_path"] == "/c/data/progress.db"
         assert data["tracker_db_path"] == "/c/data/tracker.db"
         assert data["colony_id"] == "colony_x"
         assert "task_id" not in data
 
-    def test_pins_seeded_task_id(self) -> None:
+    def test_carries_task_id_when_provided(self) -> None:
         data = build_input_data(
-            db_path="/x/p.db",
             tracker_db_path="/x/t.db",
             colony_id="c",
-            seeded_task_id="task_42",
+            task_id="task_42",
         )
         assert data["task_id"] == "task_42"
 
@@ -165,7 +162,6 @@ def _meta(**overrides: Any) -> dict[str, Any]:
         "queen_phase": "colony",
         "queen_id": "queen_finance",
         "input_data": {
-            "db_path": "/x/p.db",
             "tracker_db_path": "/x/t.db",
             "colony_id": "c",
         },
@@ -193,13 +189,11 @@ class TestBuildMeta:
     def test_threads_input_data(self) -> None:
         meta = _meta(
             input_data={
-                "db_path": "/y/p.db",
                 "tracker_db_path": "/y/t.db",
                 "colony_id": "yc",
                 "task_id": "task_99",
             }
         )
-        assert meta["input_data"]["db_path"] == "/y/p.db"
         assert meta["input_data"]["tracker_db_path"] == "/y/t.db"
         assert meta["input_data"]["task_id"] == "task_99"
 

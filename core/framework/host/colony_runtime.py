@@ -1224,18 +1224,13 @@ class ColonyRuntime:
         except Exception:
             logger.debug("Spawn-time MCP credential filter failed", exc_info=True)
 
-        # Colony progress tracker + per-spawn extra skills: build the
-        # active skill list for THIS worker. The colony-progress-tracker
-        # is auto-activated when a progress.db exists (workers need it
-        # to claim/update queue rows). ``extra_skills`` is the queen's
-        # explicit attachment via run_parallel_workers — used to factor
-        # shared protocol out of the per-task prose into a skill the
-        # worker reads once.
+        # Per-spawn extra skills: build the active skill list for THIS
+        # worker. ``extra_skills`` is the queen's explicit attachment via
+        # run_parallel_workers — used to factor shared protocol out of
+        # the per-task prose into a skill the worker reads once.
         _spawn_catalog = self.skills_catalog_prompt
         _spawn_skill_dirs = self.skill_dirs
         _active_skills: list[str] = []
-        if isinstance(input_data, dict) and input_data.get("db_path"):
-            _active_skills.append("hive.colony-progress-tracker")
         if extra_skills:
             # De-dupe while preserving order so the prompt is stable.
             seen = set(_active_skills)
@@ -1330,15 +1325,11 @@ class ColonyRuntime:
             )
 
             # Workers pick up UI-driven override changes via this provider,
-            # which reads the live catalog on each iteration. The db_path
-            # pre-activated catalog stays static because its contents are
-            # built for *this* worker's task (a tombstone toggle from the
-            # UI should not yank it mid-run).
-            _db_path_pre_activated = bool(isinstance(input_data, dict) and input_data.get("db_path"))
+            # which reads the live catalog on each iteration.
             # Default-bind the manager into the closure so each loop iteration
             # captures the same manager instance — pyflakes B023 would flag a
             # free-variable capture here.
-            _provider = None if _db_path_pre_activated else (lambda mgr=self._skills_manager: mgr.skills_catalog_prompt)
+            _provider = lambda mgr=self._skills_manager: mgr.skills_catalog_prompt
 
             # Task-system fields. Each worker owns its session task list;
             # picked_up_from records the colony template entry it was

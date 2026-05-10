@@ -1178,14 +1178,13 @@ async def fork_session_into_colony(
        the colony resumes with the queen's entire conversation history.
     3. Multiple independent sessions can be created against the same colony,
        giving parallel execution capacity without separate worker configs.
-    4. Initializes (or ensures) ``data/progress.db`` — the colony's SQLite
-       task queue + progress ledger. When *tasks* is provided, the queen-
-       authored task batch is seeded into the queue in one transaction.
-       The absolute DB path is threaded into the worker's ``input_data``
-       so spawned workers see it in their first user message.
+    4. Initializes (or ensures) ``data/tracker.db`` — the colony's SQLite
+       tracker. The absolute DB path is threaded into the worker's
+       ``input_data`` so spawned workers see it in their first user
+       message.
 
     Returns ``{"colony_path", "colony_name", "queen_session_id", "is_new",
-              "db_path", "task_ids"}``.
+              "tracker_db_path"}``.
     """
     import asyncio
     import json
@@ -1194,7 +1193,6 @@ async def fork_session_into_colony(
 
     from framework.agent_loop.agent_loop import AgentLoop, LoopConfig
     from framework.agent_loop.types import AgentContext
-    from framework.host.progress_db import ensure_progress_db, seed_tasks
     from framework.host.tracker_db import ensure_tracker_db
     from framework.server.session_manager import _queen_session_dir
 
@@ -1264,47 +1262,10 @@ async def fork_session_into_colony(
     colony_dir.mkdir(parents=True, exist_ok=True)
     (colony_dir / "data").mkdir(exist_ok=True)
 
-    # ── 0. Ensure the colony's progress + tracker DBs exist and seed tasks ──
-    # Runs before worker.json is written so both DB paths can be threaded
+    # ── 0. Ensure the colony's tracker DB exists ──────────────────────
+    # Runs before worker.json is written so the DB path can be threaded
     # into input_data. Idempotent on reruns of the same colony name.
-    # tracker.db is the queen-owned domain DB (separate from progress.db,
-    # which is the framework-owned task queue) — see framework.host.tracker_db.
-    db_path = await asyncio.to_thread(ensure_progress_db, colony_dir)
     tracker_db_path = await asyncio.to_thread(ensure_tracker_db, colony_dir)
-    seeded_task_ids: list[str] = []
-    if tasks:
-        seeded_task_ids = await asyncio.to_thread(seed_tasks, db_path, tasks, source="queen_create")
-        logger.info(
-            "progress_db: seeded %d task(s) into colony '%s'",
-            len(seeded_task_ids),
-            colony_name,
-        )
-    elif task and task.strip():
-        # Phase 2 auto-seed: when the queen uses the simple single-task
-        # form of create_colony (no explicit ``tasks=[{...}]`` list),
-        # insert exactly one row so the first worker spawned into this
-        # colony has something to claim. Without this the queue is
-        # empty and the worker falls back to executing from the chat
-        # spawn message, defeating the cross-run durability the tracker
-        # exists for.
-        try:
-            seeded_task_ids = await asyncio.to_thread(
-                seed_tasks,
-                db_path,
-                [{"goal": task.strip()}],
-                source="create_colony_auto",
-            )
-            logger.info(
-                "progress_db: auto-seeded 1 task into colony '%s' (task_id=%s, from single-task create_colony form)",
-                colony_name,
-                seeded_task_ids[0] if seeded_task_ids else "?",
-            )
-        except Exception as exc:
-            logger.warning(
-                "progress_db: auto-seed failed for colony '%s' (continuing without a pre-seeded row): %s",
-                colony_name,
-                exc,
-            )
 
     # Fixed worker name and config path are already computed above so
     # ``is_new`` can be derived from worker.json rather than the colony
@@ -1351,10 +1312,8 @@ async def fork_session_into_colony(
     )
 
     _worker_input_data = build_input_data(
-        db_path=str(db_path),
         tracker_db_path=str(tracker_db_path),
         colony_id=colony_name,
-        seeded_task_id=seeded_task_ids[0] if seeded_task_ids else None,
     )
 
     queen_config: LoopConfig | None = getattr(queen_loop, "_config", None)
@@ -1706,9 +1665,7 @@ async def fork_session_into_colony(
         "colony_name": colony_name,
         "queen_session_id": colony_session_id,
         "is_new": is_new,
-        "db_path": str(db_path),
         "tracker_db_path": str(tracker_db_path),
-        "task_ids": seeded_task_ids,
         # "in_progress" when a background compactor was scheduled above,
         # "skipped" when the source queen dir was missing (nothing to
         # compact). Frontend uses this to decide whether to display a

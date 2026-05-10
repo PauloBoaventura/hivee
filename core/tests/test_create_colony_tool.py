@@ -88,6 +88,7 @@ def patched_fork(monkeypatch):
         task: str,
         tasks: list[dict] | None = None,
         concurrency_hint: int | None = None,
+        worker_profiles: list[dict] | None = None,
     ) -> dict:
         calls.append(
             {
@@ -96,6 +97,7 @@ def patched_fork(monkeypatch):
                 "task": task,
                 "tasks": tasks,
                 "concurrency_hint": concurrency_hint,
+                "worker_profiles": worker_profiles,
             }
         )
         return {
@@ -103,8 +105,7 @@ def patched_fork(monkeypatch):
             "colony_name": colony_name,
             "queen_session_id": "session_fake_fork_id",
             "is_new": True,
-            "db_path": f"/tmp/fake_colonies/{colony_name}/data/progress.db",
-            "task_ids": [],
+            "tracker_db_path": f"/tmp/fake_colonies/{colony_name}/data/tracker.db",
         }
 
     monkeypatch.setattr(

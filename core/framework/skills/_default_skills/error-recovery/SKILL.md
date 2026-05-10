@@ -27,4 +27,4 @@ When a tool call fails:
 sqlite3 "$DB_PATH" "UPDATE tasks SET status='failed', last_error='<one-sentence reason>', completed_at=datetime('now'), updated_at=datetime('now') WHERE id='<task-id>' AND worker_id='<your-worker-id>';"
 ```
 
-The `tasks.retry_count` column and the stale-claim reclaimer handle auto-retry for crashes; your job is the within-run decision tree above. See `hive.colony-progress-tracker` for the full queue protocol.
+The runtime may record task attempts in protected tracker tables; your job is the within-run decision tree above. Put durable partial state in the queen-registered tracker table with `tracker_upsert` before reporting failure.

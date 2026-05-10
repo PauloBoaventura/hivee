@@ -19,6 +19,6 @@ You operate under a finite context window. Older tool results WILL be pruned. Ex
 - Specific lines, values, or IDs (not entire files)
 - Analysis conclusions (not raw data)
 
-**Handoffs between tasks** happen through `progress.db`, not through shared-buffer handoff blobs. When you finish a task, any state the next worker needs goes into the task row itself (`steps.evidence`, `tasks.last_error`, `sop_checklist.note`) — see `hive.colony-progress-tracker`. Use `_working_notes` for things the DB schema doesn't cover.
+**Handoffs between tasks** happen through tracker tables, not shared-buffer handoff blobs. When you finish a task, write structured state with `tracker_upsert` so the queen can validate it with SQL. Use `_working_notes` only for things the tracker schema doesn't cover.
 
 You will receive an alert when context reaches {{warn_at_usage_ratio_pct}}% — preserve immediately.

@@ -255,7 +255,6 @@ def test_colony_tools_include_monitoring_and_review() -> None:
         # Live-worker controls
         "get_worker_status",
         "inject_message",
-        "reply_to_worker",
         "stop_worker",
         # Post-run review / scheduling
         "set_trigger",

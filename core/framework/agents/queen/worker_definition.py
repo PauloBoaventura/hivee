@@ -108,25 +108,21 @@ def build_system_prompt(task: str | None) -> str:
 
 def build_input_data(
     *,
-    db_path: str,
     tracker_db_path: str,
     colony_id: str,
-    seeded_task_id: str | None = None,
+    task_id: str | None = None,
 ) -> dict[str, Any]:
     """Threaded into the worker's first user message via
-    ``_format_spawn_task_message`` so the worker can claim queue rows
-    (progress.db) and write tracker rows (tracker.db) without deriving
-    paths from layout assumptions. ``seeded_task_id`` pins the worker
-    to a specific progress.db row (colony-progress-tracker assigned-
-    task-id branch).
+    ``_format_spawn_task_message`` so the worker can write tracker rows
+    (tracker.db) without deriving paths from layout assumptions.
+    ``task_id`` is a framework task-list breadcrumb, not a DB row id.
     """
     data: dict[str, Any] = {
-        "db_path": db_path,
         "tracker_db_path": tracker_db_path,
         "colony_id": colony_id,
     }
-    if seeded_task_id:
-        data["task_id"] = seeded_task_id
+    if task_id:
+        data["task_id"] = task_id
     return data
 
 

@@ -344,8 +344,8 @@ def test_ensure_tracker_db_patches_existing_worker_config(tmp_path: Path) -> Non
 
     patched = json.loads(cfg.read_text(encoding="utf-8"))
     assert patched["input_data"]["tracker_db_path"] == str(db_path)
-    # Pre-existing keys are preserved.
-    assert patched["input_data"]["db_path"] == "/x/progress.db"
+    # Legacy ProgressDB context is removed.
+    assert "db_path" not in patched["input_data"]
 
 
 def test_patch_worker_configs_idempotent(tmp_path: Path) -> None:

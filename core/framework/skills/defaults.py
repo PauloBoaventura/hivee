@@ -32,11 +32,8 @@ def is_batch_scenario(text: str) -> bool:
 
     Kept as a no-op so the agent_loop call site (which wraps it in an
     ``if ctx.default_skill_batch_nudge:`` guard that's also now always
-    empty) can stay unchanged until a broader cleanup.  The old
-    ``_batch_ledger`` shared-buffer feature was replaced by the
-    per-colony SQLite task queue (``hive.colony-progress-tracker``),
-    which lives in ``progress.db`` and is authoritative for batch
-    state across workers and runs.
+    empty) can stay unchanged until a broader cleanup. Batch state now
+    lives in tracker tables and queen-registered worker write columns.
     """
     return False
 
@@ -56,26 +53,20 @@ def _apply_overrides(skill_name: str, body: str, overrides: dict[str, Any]) -> s
 
 # Ordered list of default skills (name → directory).
 #
-# Removed on 2026-04-15 as part of the colony-progress-tracker rollout:
-#   - hive.task-decomposition — steps table in progress.db supersedes
-#     in-memory ``_working_notes → Current Plan`` decomposition.
-#   - hive.batch-ledger       — tasks table in progress.db supersedes
-#     the ``_batch_ledger`` dict-shaped queue with its pending →
-#     in_progress → completed/failed/skipped state machine.
-# Both were duplicating state that belongs in SQLite.
+# Removed default queue skills duplicated state that now belongs in
+# tracker.db tables.
 SKILL_REGISTRY: dict[str, str] = {
     "hive.note-taking": "note-taking",
     "hive.context-preservation": "context-preservation",
     "hive.quality-monitor": "quality-monitor",
     "hive.error-recovery": "error-recovery",
-    "hive.colony-progress-tracker": "colony-progress-tracker",
     "hive.writing-hive-skills": "writing-hive-skills",
 }
 
 # Shared buffer keys referenced by the remaining default skills (used
 # for permission auto-inclusion). The dead keys for batch-ledger,
 # task-decomposition, the handoff buffer, and the error-log buffers
-# were removed when those features migrated to progress.db.
+# were removed when those features migrated to tracker.db.
 DATA_BUFFER_KEYS: list[str] = [
     # note-taking
     "_working_notes",
@@ -239,10 +230,9 @@ class DefaultSkillManager:
         """Deprecated: always returns None.
 
         The ``hive.batch-ledger`` default skill was removed when batch
-        tracking moved into ``progress.db`` (``hive.colony-progress-
-        tracker``). Callers in agent_host, colony_runtime, and
-        orchestrator still read this property; returning None keeps
-        them functional with no system-prompt nudge.
+        tracking moved into tracker.db. Callers in agent_host,
+        colony_runtime, and orchestrator still read this property;
+        returning None keeps them functional with no system-prompt nudge.
         """
         return None
 
