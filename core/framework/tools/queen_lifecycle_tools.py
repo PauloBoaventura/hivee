@@ -1287,20 +1287,36 @@ def register_queen_lifecycle_tools(
 
         # TrackerDB context wiring: pass an explicit tracker_db_path to
         # every worker so tracker tools do not infer paths from stale
-        # session.worker_path / colony_id state.
+        # session.worker_path / colony_id state. Prefer the resolver
+        # the queen's tracker tools use (execution context) so this
+        # preflight reads from the same DB that tracker_register_writable
+        # wrote to — otherwise the gate can falsely report "no tables
+        # registered" when colony.colony_id (session.id for queen DM
+        # sessions) diverges from the on-disk colony name. Fall back to
+        # the colony attribute chain when the execution context isn't
+        # populated (e.g. tests).
         _tracker_db_path: str | None = None
         _colony_id: str | None = None
         try:
             from framework.config import COLONIES_DIR
             from framework.host.tracker_db import ensure_tracker_db as _ensure_tracker_db
+            from framework.tools.tracker_tools import (
+                _resolve_tracker_db_path as _resolve_tdb_from_ctx,
+            )
 
             _colony_id = (
-                getattr(colony, "colony_name", None)
-                or getattr(session, "colony_name", None)
-                or getattr(colony, "colony_id", None)
+                getattr(session, "colony_name", None)
+                or getattr(colony, "colony_name", None)
                 or getattr(session, "colony_id", None)
+                or getattr(colony, "colony_id", None)
             )
-            if _colony_id:
+            _resolved = _resolve_tdb_from_ctx()
+            if _resolved is not None:
+                _cdir = _resolved.parent.parent
+                _tracker_db_path = str(
+                    (await asyncio.to_thread(_ensure_tracker_db, _cdir)).resolve()
+                )
+            elif _colony_id:
                 _cdir = COLONIES_DIR / str(_colony_id)
                 _tracker_db_path = str(
                     (await asyncio.to_thread(_ensure_tracker_db, _cdir)).resolve()
