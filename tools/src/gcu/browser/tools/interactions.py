@@ -818,16 +818,35 @@ def register_interaction_tools(mcp: FastMCP) -> None:
         """
         Scroll the page or a specific scrollable container.
 
+        Many modern sites (LinkedIn, Twitter/X, Gmail, infinite feeds,
+        chat apps) lazy-load content as you scroll, and the real scroll
+        container is a nested element — NOT the page body. Signs the
+        body is not the scroller: ``document.body`` height equals window
+        height, the page "doesn't scroll", or only the first N items
+        appear after scrolling. In those cases the actual scroller is
+        usually ``<main>``, a feed wrapper, or a panel with
+        ``overflow: auto`` whose ``scrollHeight > clientHeight``. Pass
+        that element's selector explicitly. Expect to call this tool
+        repeatedly — each scroll triggers the next batch of items to
+        load, and totals (e.g. "115 results") will only be reachable
+        after many successive scrolls with short waits in between.
+        For virtualized lists, previously-loaded items may unmount as
+        you scroll past them, so collect data incrementally rather than
+        assuming everything stays in the DOM.
+
         Args:
             direction: Scroll direction (up, down, left, right)
-            amount: Scroll amount in pixels (default: 500)
+            amount: Scroll amount in pixels (default: 500). For lazy-
+                loaded feeds, prefer larger amounts (1500-3000) or
+                repeated calls to trigger loading.
             selector: Optional CSS selector for the container to scroll.
                 Supports '>>>' shadow-piercing selectors. When omitted,
                 the tool picks the scrollable container at the viewport
                 center, then falls back to the largest visible
-                scrollable element, then to the window. Use this when
-                auto-pick scrolls the wrong area (e.g. nested panels,
-                modals over a long page, chat history beside a sidebar).
+                scrollable element, then to the window. Pass this
+                explicitly when the page has lazy loading, nested
+                panels, modals over a long page, or chat history beside
+                a sidebar — auto-pick can target the wrong area.
             tab_id: Chrome tab ID (default: active tab)
             profile: Browser profile name (default: "default")
             auto_snapshot_mode: Controls the accessibility snapshot taken
