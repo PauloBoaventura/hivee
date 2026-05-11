@@ -28,7 +28,6 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -54,66 +53,6 @@ CREATE TABLE IF NOT EXISTS _tracker_meta (
     value           TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS _tasks (
-    id              TEXT PRIMARY KEY,
-    seq             INTEGER,
-    priority        INTEGER NOT NULL DEFAULT 0,
-    goal            TEXT NOT NULL,
-    payload         TEXT,
-    status          TEXT NOT NULL DEFAULT 'pending',
-    worker_id       TEXT,
-    claim_token     TEXT,
-    claimed_at      TEXT,
-    started_at      TEXT,
-    completed_at    TEXT,
-    created_at      TEXT NOT NULL,
-    updated_at      TEXT NOT NULL,
-    retry_count     INTEGER NOT NULL DEFAULT 0,
-    max_retries     INTEGER NOT NULL DEFAULT 3,
-    last_error      TEXT,
-    parent_task_id  TEXT REFERENCES _tasks(id) ON DELETE SET NULL,
-    source          TEXT
-);
-
-CREATE TABLE IF NOT EXISTS _steps (
-    id              TEXT PRIMARY KEY,
-    task_id         TEXT NOT NULL REFERENCES _tasks(id) ON DELETE CASCADE,
-    seq             INTEGER NOT NULL,
-    title           TEXT NOT NULL,
-    detail          TEXT,
-    status          TEXT NOT NULL DEFAULT 'pending',
-    evidence        TEXT,
-    worker_id       TEXT,
-    started_at      TEXT,
-    completed_at    TEXT,
-    UNIQUE (task_id, seq)
-);
-
-CREATE TABLE IF NOT EXISTS _sop_checklist (
-    id              TEXT PRIMARY KEY,
-    task_id         TEXT NOT NULL REFERENCES _tasks(id) ON DELETE CASCADE,
-    key             TEXT NOT NULL,
-    description     TEXT NOT NULL,
-    required        INTEGER NOT NULL DEFAULT 1,
-    done_at         TEXT,
-    done_by         TEXT,
-    note            TEXT,
-    UNIQUE (task_id, key)
-);
-
-CREATE INDEX IF NOT EXISTS idx_tracker_tasks_claimable
-    ON _tasks(status, priority DESC, seq, created_at)
-    WHERE status = 'pending';
-
-CREATE INDEX IF NOT EXISTS idx_tracker_steps_task_seq
-    ON _steps(task_id, seq);
-
-CREATE INDEX IF NOT EXISTS idx_tracker_sop_required_open
-    ON _sop_checklist(task_id, required, done_at);
-
-CREATE INDEX IF NOT EXISTS idx_tracker_tasks_status
-    ON _tasks(status, updated_at);
 """
 
 _PRAGMAS = (
@@ -284,59 +223,6 @@ def ensure_all_colony_tracker_dbs(colonies_root: Path | None = None) -> list[Pat
                 "tracker_db: failed to ensure DB for colony '%s': %s", entry.name, e
             )
     return initialized
-
-
-def enqueue_framework_task(
-    db_path: Path,
-    goal: str,
-    *,
-    payload: Any = None,
-    priority: int = 0,
-    parent_task_id: str | None = None,
-    source: str | None = None,
-) -> str:
-    """Append a framework task row to tracker.db protected tables.
-
-    This replaces the old ProgressDB queue write path. It is framework
-    code, not a queen/worker SQL surface, so it may mutate ``_*`` tables.
-    """
-    task_id = str(uuid.uuid4())
-    now = _now_iso()
-    payload_text = None if payload is None else json.dumps(payload, ensure_ascii=False)
-    con = _connect(Path(db_path))
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        row = con.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM _tasks").fetchone()
-        seq = int(row[0] or 1)
-        con.execute(
-            """
-            INSERT INTO _tasks (
-                id, seq, priority, goal, payload, status, created_at,
-                updated_at, parent_task_id, source
-            ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
-            """,
-            (
-                task_id,
-                seq,
-                int(priority),
-                goal,
-                payload_text,
-                now,
-                now,
-                parent_task_id,
-                source,
-            ),
-        )
-        con.execute("COMMIT")
-    except Exception:
-        try:
-            con.execute("ROLLBACK")
-        except sqlite3.Error:
-            pass
-        raise
-    finally:
-        con.close()
-    return task_id
 
 
 # ---------------------------------------------------------------------------
@@ -687,7 +573,6 @@ __all__ = [
     "PROTECTED_PREFIX",
     "ensure_all_colony_tracker_dbs",
     "ensure_tracker_db",
-    "enqueue_framework_task",
     "execute_sql",
     "validate_sql",
 ]

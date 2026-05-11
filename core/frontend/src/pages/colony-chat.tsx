@@ -1342,7 +1342,7 @@ export default function ColonyChat() {
 
   // Publish the colony directory name (e.g. ``linkedin_honeycomb_messaging``)
   // alongside the session id. The panel's progress + data tabs route by
-  // colony name, not session — one progress.db per colony, independent
+  // colony name, not session — one tracker.db per colony, independent
   // of which session is open. Comes from ``LiveSession.colony_id`` (the
   // on-disk directory) rather than the URL slug, which is mangled by
   // ``slugToColonyId``.

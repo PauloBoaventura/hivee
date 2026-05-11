@@ -39,9 +39,9 @@ export interface UpdateRowRequest {
 }
 
 export const colonyDataApi = {
-  /** List user tables in the colony's progress.db with row counts.
+  /** List user tables in the colony's tracker.db with row counts.
    *
-   *  Routed by colony directory name (not session) because progress.db
+   *  Routed by colony directory name (not session) because tracker.db
    *  is per-colony — one DB serves every session for that colony, and
    *  the data is reachable even when no session is live. */
   listTables: (colonyName: string) =>

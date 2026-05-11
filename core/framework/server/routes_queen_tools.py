@@ -162,15 +162,16 @@ def _synthetic_entries() -> list[dict[str, Any]]:
 
 
 def _live_queen_session(manager: Any, queen_id: str) -> Any:
-    """Return any live DM session owned by this queen, or ``None``."""
+    """Return a live session owned by this queen, preferring DM over colony."""
     sessions = getattr(manager, "_sessions", None) or {}
+    colony_fallback = None
     for session in sessions.values():
         if getattr(session, "queen_name", None) != queen_id:
             continue
-        # Prefer DM (non-colony) sessions
         if getattr(session, "colony_runtime", None) is None:
             return session
-    return None
+        colony_fallback = session
+    return colony_fallback
 
 
 def _render_mcp_servers(
@@ -230,9 +231,13 @@ def _catalog_from_live_session(session: Any) -> dict[str, list[dict[str, Any]]]:
         if phase_state is None:
             return {}
         mcp_names = getattr(phase_state, "mcp_tool_names_all", set()) or set()
-        independent_tools = getattr(phase_state, "independent_tools", []) or []
+        phase_tools = (
+            phase_state.get_current_tools()
+            if callable(getattr(phase_state, "get_current_tools", None))
+            else getattr(phase_state, "independent_tools", []) or []
+        )
         result: dict[str, list[dict[str, Any]]] = {"MCP Tools": []}
-        for tool in independent_tools:
+        for tool in phase_tools:
             if tool.name not in mcp_names:
                 continue
             result["MCP Tools"].append(
@@ -286,18 +291,25 @@ def _lifecycle_entries(
     session: Any,
     mcp_tool_names_all: set[str],
 ) -> list[dict[str, Any]]:
-    """Lifecycle tools = independent_tools minus MCP-origin minus synthetic.
+    """Lifecycle tools = current-phase tools minus MCP-origin minus synthetic.
 
     We compute this from a live session when available so the list exactly
-    matches what the queen actually sees on her next turn.
+    matches what the queen actually sees on her next turn. Uses
+    ``get_current_tools()`` so the correct phase (independent / incubating /
+    colony) is reflected.
     """
     if session is None:
         return []
     phase_state = getattr(session, "phase_state", None)
     if phase_state is None:
         return []
+    current_tools = (
+        phase_state.get_current_tools()
+        if callable(getattr(phase_state, "get_current_tools", None))
+        else getattr(phase_state, "independent_tools", []) or []
+    )
     result: list[dict[str, Any]] = []
-    for tool in getattr(phase_state, "independent_tools", []) or []:
+    for tool in current_tools:
         if tool.name in mcp_tool_names_all:
             continue
         if tool.name in _SYNTHETIC_NAMES:

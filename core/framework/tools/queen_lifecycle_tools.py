@@ -1292,40 +1292,6 @@ def register_queen_lifecycle_tools(
             except Exception:
                 pass  # if we can't check, don't block — let it fail at upsert time
 
-        _tracker_task_ids: list[str | None] = [None] * len(tasks)
-        if _tracker_db_path:
-            try:
-                from pathlib import Path as _PathT
-
-                from framework.host.tracker_db import (
-                    enqueue_framework_task as _enqueue_tracker_task,
-                )
-
-                _tracker_path_obj = _PathT(_tracker_db_path)
-                for _i, _spec in enumerate(tasks):
-                    if not isinstance(_spec, dict):
-                        continue
-                    _task_text_pre = str(_spec.get("task", "")).strip()
-                    if not _task_text_pre:
-                        continue
-                    _tracker_task_ids[_i] = await asyncio.to_thread(
-                        _enqueue_tracker_task,
-                        _tracker_path_obj,
-                        _task_text_pre,
-                        payload=(
-                            _spec.get("data")
-                            if isinstance(_spec.get("data"), dict)
-                            else None
-                        ),
-                        source="run_parallel_workers",
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "run_parallel_workers: failed to record tracker task rows "
-                    "(spawn proceeding without task_id): %s",
-                    exc,
-                )
-
         # Normalise: each entry must have a non-empty "task" string.
         normalised: list[dict] = []
         for i, spec in enumerate(tasks):
@@ -1341,8 +1307,6 @@ def register_queen_lifecycle_tools(
                     "tracker_db_path": _tracker_db_path,
                     "colony_id": _colony_id,
                 }
-                if _tracker_task_ids[i]:
-                    spec_data["task_id"] = _tracker_task_ids[i]
             entry: dict[str, Any] = {
                 "task": task_text,
                 "data": spec_data or None,
@@ -2977,145 +2941,6 @@ def register_queen_lifecycle_tools(
     )
     tools_registered += 1
 
-    # --- enqueue_task ------------------------------------------------------------
-
-    async def enqueue_task_tool(
-        *,
-        colony_name: str,
-        goal: str,
-        steps: list[dict] | None = None,
-        sop_items: list[dict] | None = None,
-        payload: Any = None,
-        priority: int = 0,
-        parent_task_id: str | None = None,
-    ) -> str:
-        """Append a single task to an existing colony's tracker task table.
-
-        Use this when the colony is already created and more work
-        needs to be fanned out (webhook-driven, follow-up requests,
-        worker-generated subtasks). The colony's workers pick it up
-        on their next claim cycle.
-        """
-        cn = (colony_name or "").strip()
-        if not _COLONY_NAME_RE.match(cn):
-            return json.dumps({"error": "colony_name must be lowercase alphanumeric with underscores"})
-
-        from framework.config import COLONIES_DIR as _COLONIES_DIR
-        from framework.host.tracker_db import (
-            enqueue_framework_task as _enqueue_task,
-            ensure_tracker_db as _ensure_db,
-        )
-
-        colony_dir = _COLONIES_DIR / cn
-        if not colony_dir.is_dir():
-            return json.dumps({"error": f"colony '{cn}' not found"})
-
-        try:
-            tracker_db_path = await asyncio.to_thread(_ensure_db, colony_dir)
-            task_id = await asyncio.to_thread(
-                _enqueue_task,
-                tracker_db_path,
-                goal,
-                payload=payload,
-                priority=priority,
-                parent_task_id=parent_task_id,
-                source="enqueue_task",
-            )
-        except Exception as e:
-            logger.exception("enqueue_task: failed to insert row")
-            return json.dumps({"error": f"enqueue_task failed: {e}"})
-
-        return json.dumps(
-            {
-                "status": "enqueued",
-                "colony_name": cn,
-                "task_id": task_id,
-                "tracker_db_path": str(tracker_db_path),
-            }
-        )
-
-    _enqueue_task_tool = Tool(
-        name="enqueue_task",
-        description=(
-            "Append a single task to an existing colony's tracker.db "
-            "protected task table. Use this after create_colony when more work needs "
-            "to be fanned out — e.g. a webhook fired, the user asked "
-            "for a follow-up run, or a worker spawned a subtask. The "
-            "runtime records the task in TrackerDB."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "colony_name": {
-                    "type": "string",
-                    "description": "Target colony name (lowercase + underscores).",
-                },
-                "goal": {
-                    "type": "string",
-                    "description": (
-                        "Human-readable task description. Self-contained — "
-                        "the worker has no context beyond this string plus "
-                        "any steps/sop_items/payload you attach."
-                    ),
-                },
-                "steps": {
-                    "type": "array",
-                    "description": (
-                        "Optional ordered subtasks the worker should "
-                        "check off as it executes. Each step needs a "
-                        "'title'; optional 'detail' for longer "
-                        "instructions."
-                    ),
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "title": {"type": "string"},
-                            "detail": {"type": "string"},
-                        },
-                        "required": ["title"],
-                    },
-                },
-                "sop_items": {
-                    "type": "array",
-                    "description": (
-                        "Optional hard-gate checklist items the worker "
-                        "MUST address before marking the task done. "
-                        "Each item needs a 'key' (slug) and "
-                        "'description'; 'required' defaults to true."
-                    ),
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "key": {"type": "string"},
-                            "description": {"type": "string"},
-                            "required": {"type": "boolean"},
-                        },
-                        "required": ["key", "description"],
-                    },
-                },
-                "payload": {
-                    "description": ("Optional task-specific parameters. Stored as JSON in the 'payload' column."),
-                },
-                "priority": {
-                    "type": "integer",
-                    "description": "Higher values run first. Default 0.",
-                },
-                "parent_task_id": {
-                    "type": "string",
-                    "description": (
-                        "Optional reference to an existing task this "
-                        "one was spawned from (audit only; no blocking "
-                        "dependency resolver today)."
-                    ),
-                },
-            },
-            "required": ["colony_name", "goal"],
-        },
-    )
-    # NOTE: ``enqueue_task`` is intentionally NOT registered. The Tool object
-    # and helper above are kept for potential reuse by other code paths or
-    # a future per-persona registration gate; today no queen receives it.
-    _ = _enqueue_task_tool
 
     # --- stop_worker_and_review --------------------------------------------------
 

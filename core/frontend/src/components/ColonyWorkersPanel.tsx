@@ -4,7 +4,6 @@ import {
   Users,
   RefreshCw,
   Wrench,
-  Database,
   ChevronRight,
   ChevronDown,
   ArrowLeft,
@@ -25,8 +24,6 @@ import {
   colonyWorkersApi,
   type ColonySkill,
   type ColonyTool,
-  type ProgressSnapshot,
-  type ProgressStep,
   type WorkerSummary,
 } from "@/api/colonyWorkers";
 import { coloniesApi, type WorkerProfile } from "@/api/colonies";
@@ -81,17 +78,6 @@ function fmtStarted(ts: number): string {
     return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   } catch {
     return "";
-  }
-}
-
-function fmtIso(ts: string | null | undefined): string {
-  if (!ts) return "";
-  try {
-    const d = new Date(ts);
-    if (isNaN(d.getTime())) return ts;
-    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-  } catch {
-    return ts;
   }
 }
 
@@ -1208,7 +1194,7 @@ function Section({ label, children }: { label: string; children: React.ReactNode
   );
 }
 
-// ── Data tab (airtable-style view of progress.db tables) ──────────────
+// ── Data tab (airtable-style view of tracker.db tables) ──────────────
 
 /** Table-list refresh cadence. Slower than the row poll because the
  *  overview only drives the row-count chips; the operator doesn't care
@@ -1271,7 +1257,7 @@ function DataTab({ colonyName }: { colonyName: string | null }) {
   if (!colonyName) {
     return (
       <p className="text-xs text-muted-foreground text-center py-8 px-4">
-        This session isn't bound to a colony yet — no progress.db to view.
+        This session isn't bound to a colony yet — no tracker.db to view.
       </p>
     );
   }
@@ -1290,7 +1276,7 @@ function DataTab({ colonyName }: { colonyName: string | null }) {
         </div>
       ) : tables.length === 0 ? (
         <p className="text-xs text-muted-foreground text-center py-8">
-          No tables in progress.db (or the colony has no DB yet).
+          No tables in tracker.db (or the colony has no DB yet).
         </p>
       ) : (
         <>
@@ -1318,7 +1304,7 @@ function DataTab({ colonyName }: { colonyName: string | null }) {
           </div>
 
           <p className="text-[10px] text-muted-foreground mb-2 italic">
-            Live view — edits write directly to progress.db. A running worker
+            Live view — edits write directly to tracker.db. A running worker
             may not notice until its next DB read.
           </p>
 
@@ -1578,15 +1564,6 @@ function WorkerDetail({
   workerId: string;
   onBack: () => void;
 }) {
-  // Historical workers (loaded from disk rather than live memory) have
-  // no live progress.db stream to attach to — opening the SSE just
-  // renders "No progress rows yet." forever, which is what the user
-  // was calling "middle of nowhere". Skip the stream and show the
-  // result summary + an archived-conversation hint instead.
-  const isHistorical =
-    worker?.status === "historical" ||
-    (worker != null && !isWorkerActive(worker) && worker.result == null);
-
   return (
     <div className="px-4 py-3">
       <button
@@ -1634,12 +1611,6 @@ function WorkerDetail({
       <div className="mb-3">
         <WorkerTaskList workerId={workerId} colonyName={colonyName} />
       </div>
-
-      {isHistorical ? (
-        <HistoricalWorkerPlaceholder workerId={workerId} />
-      ) : (
-        <LiveWorkerProgress colonyName={colonyName} workerId={workerId} />
-      )}
     </div>
   );
 }
@@ -1666,234 +1637,7 @@ function WorkerTaskList({
   );
 }
 
-function LiveWorkerProgress({
-  colonyName,
-  workerId,
-}: {
-  colonyName: string | null;
-  workerId: string;
-}) {
-  const { snapshot, streamState, error } = useProgressStream(colonyName, workerId);
-  return (
-    <>
-      <div className="flex items-center justify-between mb-1.5">
-        <div className="flex items-center gap-1.5 text-xs font-semibold text-foreground/90">
-          <Database className="w-3.5 h-3.5 text-primary" />
-          Progress (progress.db)
-        </div>
-        <StreamBadge state={streamState} />
-      </div>
 
-      {error && (
-        <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive mb-2">
-          {error}
-        </div>
-      )}
-
-      <ProgressView snapshot={snapshot} />
-    </>
-  );
-}
-
-function HistoricalWorkerPlaceholder({ workerId }: { workerId: string }) {
-  return (
-    <div className="rounded-lg border border-border/40 bg-background/30 px-3 py-4 text-xs text-muted-foreground space-y-1.5">
-      <p className="text-foreground/80">This worker has finished.</p>
-      <p>
-        Live progress is no longer streaming. The worker's full conversation is
-        archived under{" "}
-        <code className="text-[11px] font-mono text-foreground/80">
-          workers/{shortId(workerId)}/conversations/
-        </code>{" "}
-        in the session data folder — use the{" "}
-        <span className="text-foreground/80 font-medium">Data</span> button in
-        the header to open it.
-      </p>
-    </div>
-  );
-}
-
-function StreamBadge({ state }: { state: "connecting" | "open" | "closed" | "error" }) {
-  const cls =
-    state === "open"
-      ? "bg-emerald-500/15 text-emerald-500"
-      : state === "connecting"
-        ? "bg-primary/15 text-primary"
-        : state === "error"
-          ? "bg-destructive/15 text-destructive"
-          : "bg-muted text-muted-foreground";
-  return (
-    <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${cls}`}>{state}</span>
-  );
-}
-
-function ProgressView({ snapshot }: { snapshot: ProgressSnapshot }) {
-  const stepsByTask = useMemo(() => {
-    const m = new Map<string, ProgressStep[]>();
-    for (const step of snapshot.steps) {
-      const arr = m.get(step.task_id) ?? [];
-      arr.push(step);
-      m.set(step.task_id, arr);
-    }
-    for (const arr of m.values()) arr.sort((a, b) => a.seq - b.seq);
-    return m;
-  }, [snapshot.steps]);
-
-  if (snapshot.tasks.length === 0 && snapshot.steps.length === 0) {
-    return (
-      <p className="text-xs text-muted-foreground text-center py-6">
-        No progress rows yet.
-      </p>
-    );
-  }
-
-  return (
-    <ul className="flex flex-col gap-2">
-      {snapshot.tasks.map((t) => (
-        <li
-          key={t.id}
-          className="rounded-lg border border-border/60 bg-background/40 px-3 py-2"
-        >
-          <div className="flex items-start justify-between gap-2 mb-1">
-            <span className="text-xs text-foreground/90 break-words flex-1">{t.goal}</span>
-            <span
-              className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium flex-shrink-0 ${statusClasses(t.status)}`}
-            >
-              {t.status}
-            </span>
-          </div>
-          <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
-            <code className="font-mono">{t.id.slice(0, 8)}</code>
-            {t.updated_at && <span>· upd {fmtIso(t.updated_at)}</span>}
-            {t.retry_count > 0 && (
-              <span>
-                · retry {t.retry_count}/{t.max_retries}
-              </span>
-            )}
-          </div>
-
-          {(() => {
-            const steps = stepsByTask.get(t.id) ?? [];
-            if (steps.length === 0) return null;
-            return (
-              <ul className="mt-2 pl-2 border-l border-border/40 flex flex-col gap-1">
-                {steps.map((s) => (
-                  <li key={s.id} className="flex items-start gap-1.5 text-[11px]">
-                    <span
-                      className={`mt-0.5 w-1.5 h-1.5 rounded-full flex-shrink-0 ${
-                        s.status === "completed" || s.status === "done"
-                          ? "bg-emerald-500"
-                          : s.status === "failed"
-                            ? "bg-destructive"
-                            : s.status === "in_progress" || s.status === "running"
-                              ? "bg-primary animate-pulse"
-                              : "bg-muted-foreground/40"
-                      }`}
-                    />
-                    <span className="text-foreground/80 flex-1 break-words">{s.title}</span>
-                    {s.completed_at && (
-                      <span className="text-[10px] text-muted-foreground flex-shrink-0">
-                        {fmtIso(s.completed_at)}
-                      </span>
-                    )}
-                  </li>
-                ))}
-              </ul>
-            );
-          })()}
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-// ── Hook: live progress via SSE ────────────────────────────────────────
-
-function useProgressStream(colonyName: string | null, workerId: string) {
-  const [snapshot, setSnapshot] = useState<ProgressSnapshot>({ tasks: [], steps: [] });
-  const [streamState, setStreamState] = useState<"connecting" | "open" | "closed" | "error">(
-    "connecting",
-  );
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    setSnapshot({ tasks: [], steps: [] });
-    setError(null);
-    setStreamState("connecting");
-
-    // Skip the SSE connection entirely if the session isn't bound to a
-    // colony — we'd just hit a 400 on every reconnect attempt.
-    if (!colonyName) {
-      setStreamState("closed");
-      return;
-    }
-
-    const url = colonyWorkersApi.progressStreamUrl(colonyName, workerId);
-    const es = new EventSource(url);
-
-    es.addEventListener("open", () => setStreamState("open"));
-
-    es.addEventListener("snapshot", (e) => {
-      try {
-        const data = JSON.parse((e as MessageEvent).data) as ProgressSnapshot;
-        setSnapshot(data);
-        setStreamState("open");
-      } catch (err) {
-        setError(`snapshot parse failed: ${String(err)}`);
-      }
-    });
-
-    es.addEventListener("upsert", (e) => {
-      try {
-        const data = JSON.parse((e as MessageEvent).data) as ProgressSnapshot;
-        setSnapshot((prev) => mergeSnapshot(prev, data));
-      } catch (err) {
-        setError(`upsert parse failed: ${String(err)}`);
-      }
-    });
-
-    es.addEventListener("error", (e) => {
-      try {
-        const data = JSON.parse((e as MessageEvent).data) as { message?: string };
-        if (data.message) setError(data.message);
-      } catch {
-        /* EventSource raw error — state below handles it. */
-      }
-    });
-
-    es.onerror = () => {
-      // EventSource auto-retries; surface the transient state so the
-      // badge reflects reality.
-      setStreamState((s) => (s === "open" ? "error" : s));
-    };
-
-    return () => {
-      es.close();
-      setStreamState("closed");
-    };
-  }, [colonyName, workerId]);
-
-  return { snapshot, streamState, error };
-}
-
-function mergeSnapshot(prev: ProgressSnapshot, upsert: ProgressSnapshot): ProgressSnapshot {
-  const taskMap = new Map(prev.tasks.map((t) => [t.id, t]));
-  for (const t of upsert.tasks) taskMap.set(t.id, t);
-  const tasks = Array.from(taskMap.values()).sort((a, b) =>
-    b.updated_at.localeCompare(a.updated_at),
-  );
-
-  const stepMap = new Map(prev.steps.map((s) => [s.id, s]));
-  for (const s of upsert.steps) stepMap.set(s.id, s);
-  const steps = Array.from(stepMap.values()).sort((a, b) => {
-    if (a.task_id !== b.task_id) return a.task_id.localeCompare(b.task_id);
-    return a.seq - b.seq;
-  });
-
-  return { tasks, steps };
-}
-
-// ── Shared tab shell: loading / error / empty / refresh button ─────────
 
 function TabShell({
   loading,
