@@ -1311,40 +1311,59 @@ def register_queen_lifecycle_tools(
                 "(workers will rely on execution context fallback): %s",
                 exc,
             )
-        # Prerequisite: if the queen created user tables in tracker.db
-        # (tables outside the protected _prefix), at least one must be
-        # registered for worker writes before we spawn. Without this,
-        # every worker tracker_upsert call fails with "table not registered".
-        if _tracker_db_path:
-            try:
-                import sqlite3 as _sqlite3
+        # Hard prerequisite: parallel workers must coordinate via the
+        # tracker. Refuse to spawn unless at least one table is
+        # registered for worker writes. Without it workers have no
+        # shared primitive for claiming work and the queen has no way
+        # to validate progress mid-batch — markdown files and prose
+        # reports cannot replace it. Failure to resolve the tracker
+        # path is also fatal here: continuing would silently fall back
+        # to per-worker context inference, which is the wiring bug
+        # this gate exists to catch.
+        if not _tracker_db_path:
+            return json.dumps({
+                "error": (
+                    "run_parallel_workers could not resolve a tracker DB "
+                    "for this colony (no colony_id on session or colony "
+                    "runtime). This is a wiring bug — workers cannot be "
+                    "coordinated without one."
+                ),
+            })
+        try:
+            import sqlite3 as _sqlite3
 
-                _con = _sqlite3.connect(str(_tracker_db_path))
-                try:
-                    _has_user_tables = bool(
-                        _con.execute(
-                            "SELECT COUNT(*) FROM sqlite_master "
-                            "WHERE type='table' AND name NOT LIKE '\\_%' ESCAPE '\\'"
-                        ).fetchone()[0]
-                    )
-                    if _has_user_tables:
-                        _row = _con.execute(
-                            "SELECT COUNT(*) FROM _tracker_registry"
-                        ).fetchone()
-                        _reg_count = int(_row[0]) if _row else 0
-                        if _reg_count == 0:
-                            return json.dumps({
-                                "error": (
-                                    "Tracker has user tables but none are registered "
-                                    "for worker writes. Call tracker_register_writable "
-                                    "for each table workers need to write to before "
-                                    "calling run_parallel_workers."
-                                ),
-                            })
-                finally:
-                    _con.close()
-            except Exception:
-                pass  # if we can't check, don't block — let it fail at upsert time
+            _con = _sqlite3.connect(str(_tracker_db_path))
+            try:
+                _row = _con.execute(
+                    "SELECT COUNT(*) FROM _tracker_registry"
+                ).fetchone()
+                _reg_count = int(_row[0]) if _row else 0
+            finally:
+                _con.close()
+        except Exception as exc:
+            # Fail closed: if we can't read the registry, treat it as
+            # empty so the queen gets the same actionable error rather
+            # than discovering the problem one-per-worker at upsert time.
+            logger.warning(
+                "run_parallel_workers: tracker registry check failed; "
+                "treating as unregistered: %s",
+                exc,
+            )
+            _reg_count = 0
+        if _reg_count == 0:
+            return json.dumps({
+                "error": (
+                    "No tables registered for worker writes. Before "
+                    "calling run_parallel_workers: (1) model the work as "
+                    "a row-shape table with "
+                    "tracker_sql('CREATE TABLE <name> (...)'), (2) "
+                    "register it with tracker_register_writable("
+                    "table='<name>', write_columns=[...], "
+                    "key_columns=[...]). Workers need a shared tracker "
+                    "to coordinate — markdown files and prose reports "
+                    "cannot replace it."
+                ),
+            })
 
         # Normalise: each entry must have a non-empty "task" string.
         normalised: list[dict] = []

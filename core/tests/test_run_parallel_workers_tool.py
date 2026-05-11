@@ -101,6 +101,37 @@ def _stub_executor(tool_use: ToolUse) -> ToolResult:
 # ---------------------------------------------------------------------------
 
 
+def _seed_tracker_registry(colony_id: str) -> None:
+    """Seed a sentinel tracker registry row for a test colony.
+
+    ``run_parallel_workers`` refuses to spawn unless at least one
+    table is registered for worker writes (production safety gate).
+    Tests don't exercise the queen's table-modelling flow, so we
+    pre-register a sentinel table here to satisfy the gate.
+    """
+    import sqlite3
+
+    from framework.config import COLONIES_DIR
+    from framework.host.tracker_db import ensure_tracker_db
+
+    db_path = ensure_tracker_db(COLONIES_DIR / str(colony_id))
+    con = sqlite3.connect(str(db_path))
+    try:
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS test_progress "
+            "(id INTEGER PRIMARY KEY, status TEXT)"
+        )
+        con.execute(
+            "INSERT OR IGNORE INTO _tracker_registry "
+            "(table_name, write_columns, key_columns, mode, registered_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("test_progress", '["status"]', '["id"]', "upsert", "2026-05-11T00:00:00"),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
 class _FakeSession:
     """Minimal session-like object exposing ``colony`` for the tool."""
 
@@ -114,6 +145,13 @@ class _FakeSession:
         self.worker_path = None
         self.available_triggers = {}
         self.active_trigger_ids = set()
+        # Satisfy run_parallel_workers' tracker-registry preflight.
+        _colony_id = (
+            getattr(colony, "colony_name", None)
+            or getattr(colony, "colony_id", None)
+            or session_id
+        )
+        _seed_tracker_registry(str(_colony_id))
 
 
 @pytest.mark.asyncio

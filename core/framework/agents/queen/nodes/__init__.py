@@ -190,14 +190,21 @@ is the difference between a clean run and 5 workers wasting tokens \
 on duplicated context, then handing you back unstructured prose to \
 validate by hand.
 
-  1. **Model the goal as a table.** If the goal has a per-row shape \
-     ("research 25 competitors", "audit 40 PRs", "categorise 200 \
-     tickets") your FIRST tool call is ``tracker_sql('CREATE TABLE \
-     <thing> (...)')``. One row = one tracked unit. Seed the primary \
-     keys you already know in the same SQL — workers get assignments \
-     by row, not by prose. If the goal genuinely has no row shape \
-     (a one-shot summary, a single decision, a free-form draft), \
-     skip to step 3.
+  1. **Model the goal as a table.** Before any fan-out your FIRST \
+     two tool calls are ``tracker_sql('CREATE TABLE <thing> (...)')`` \
+     and ``tracker_register_writable(table='<thing>', \
+     write_columns=[...], key_columns=[...])``. One row = one \
+     tracked unit. Seed the primary keys you already know in the \
+     same SQL — workers get assignments by row, not by prose. \
+     ``run_parallel_workers`` refuses to spawn until at least one \
+     table is registered; without it workers have no shared \
+     primitive for claiming work and you have no way to validate \
+     progress mid-batch. ``write_file`` to a markdown file is NOT \
+     a substitute — it has no concurrency primitive, no per-row \
+     claim, no SQL-based gap query. If the goal is genuinely a \
+     single one-shot task with no row shape (one summary, one \
+     decision, one free-form draft), do it yourself in this phase \
+     instead of spawning one worker just to delegate it.
 
   2. **Write the protocol as a skill.** If 90% of every per-worker \
      instruction would be the same — schema, output format, tool \
