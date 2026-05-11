@@ -262,3 +262,16 @@ def test_colony_tools_include_monitoring_and_review() -> None:
         "list_triggers",
     ):
         assert required in _QUEEN_COLONY_TOOLS, f"{required} missing from colony tools"
+
+
+def test_colony_tools_include_tracker_for_parallel_workers() -> None:
+    """COLONY prompt requires tracker setup, so the callable tool list must expose it."""
+    from framework.agents.queen.nodes import _QUEEN_COLONY_TOOLS
+
+    for required in (
+        "tracker_sql",
+        "tracker_register_writable",
+        "tracker_upsert",
+        "tracker_query",
+    ):
+        assert required in _QUEEN_COLONY_TOOLS, f"{required} missing from colony tools"

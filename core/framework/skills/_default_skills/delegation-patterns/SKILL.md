@@ -23,6 +23,10 @@ Fan-out HURTS when:
 - Units depend on each other's output (sequential pipeline). Parallel workers can't see each other's results mid-run; you'd be coordinating through the tracker, which is fine but adds round-trips.
 - The work is exploratory ("figure out X"). Workers are bad at open-ended scope. Decompose first, then fan out the bounded parts.
 
+When the user explicitly asks for fan-out, do not reject the request from an untested architecture guess. If you are unsure whether a browser session, API cursor, login, or other shared resource can be used by workers, run a one-worker probe first. The probe should only inspect read-only state (for example `browser_status`, `browser_tabs`, or a harmless page read) and report what it can access. Use that result to choose the full plan.
+
+Browser and stateful-UI work has a safer pattern than "all workers click the same page." Prefer: parent extracts visible rows into the tracker, workers classify or enrich those rows in parallel, then the parent performs irreversible clicks/messages serially with verification. If the user explicitly accepts the risk of parallel UI control, workers must first discover their own browser state and claim work by stable visible identifiers, not by assumed scroll positions.
+
 ### The 4-step loop (always, in order)
 
   1. **Model the goal as a table** — `tracker_sql('CREATE TABLE …; INSERT …(seed keys you know);')`.
@@ -69,6 +73,8 @@ Always write the protocol skill BEFORE the fan-out call. Skill body should conta
 3. The output format (especially for any narrative columns: "2-3 sentences, no bullet points").
 4. The quality bar (when to use 'N/A', when to flag uncertainty in a `confidence_notes` column).
 5. Failure handling: "If you can't verify a field after 2 attempts, write 'N/A' with a one-line reason in `unverified_fields`. Don't fabricate."
+
+Before writing the skill, restate the latest user constraints and put them in the protocol. If the user changes the task mid-run, the newer instruction wins over older criteria and over any previous skill draft.
 
 The task string then carries ONLY the per-worker unique slice — typically the row keys to fill plus a one-line reminder to follow the skill.
 

@@ -105,7 +105,10 @@ async def test_create_queen_keeps_configurable_mcp_tools_in_colony_phase(monkeyp
         assert session._queen_tool_registry is registry  # type: ignore[attr-defined]
         assert "browser_open" in {t.name for t in session.phase_state.independent_tools}
         assert "browser_open" in {t.name for t in session.phase_state.incubating_tools}
-        assert "browser_open" in {t.name for t in session.phase_state.colony_tools}
+        colony_tool_names = {t.name for t in session.phase_state.colony_tools}
+        assert "browser_open" in colony_tool_names
+        assert "tracker_sql" in colony_tool_names
+        assert "tracker_register_writable" in colony_tool_names
         assert "write_file" in {t.name for t in session.phase_state.incubating_tools}
         assert "browser_open" in {t.name for t in session.phase_state.get_current_tools()}
     finally:

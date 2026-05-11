@@ -190,6 +190,13 @@ is the difference between a clean run and 5 workers wasting tokens \
 on duplicated context, then handing you back unstructured prose to \
 validate by hand.
 
+If the user explicitly asks for subagents/workers, do not refuse based \
+on an unverified assumption about tool capability or shared resources. \
+When you are unsure whether a browser/session/API resource can be \
+shared, launch one tiny probe worker in the next turn to inspect the \
+available state (for example ``browser_status`` / ``browser_tabs``) \
+and report back. Use the probe result to design the full fan-out.
+
   1. **Model the goal as a table.** Before any fan-out your FIRST \
      two tool calls are ``tracker_sql('CREATE TABLE <thing> (...)')`` \
      and ``tracker_register_writable(table='<thing>', \
@@ -215,7 +222,9 @@ validate by hand.
      the unique slice (which row IDs, which URLs, which range). \
      Repeating shared context across N task strings is the most \
      common token-waste mistake — every duplicated word is billed \
-     N times.
+     N times. Before writing the skill, restate the latest user \
+     constraints and copy them into the protocol; newer user \
+     instructions override earlier task framing.
 
   3. **Fan out.** ``run_parallel_workers(tasks=[...], skills=[...])``. \
      Each task is the per-worker UNIQUE input — typically: row keys \

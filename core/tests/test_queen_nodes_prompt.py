@@ -9,6 +9,7 @@ content; text-only models see the block removed entirely.
 from __future__ import annotations
 
 from framework.agents.queen.nodes import finalize_queen_prompt
+from framework.agents.queen.nodes import _queen_role_colony
 
 
 class TestFinalizeQueenPrompt:
@@ -50,3 +51,13 @@ class TestFinalizeQueenPrompt:
         text = "plain prompt with no markers at all"
         assert finalize_queen_prompt(text, has_vision=True) == text
         assert finalize_queen_prompt(text, has_vision=False) == text
+
+
+def test_colony_prompt_tells_queen_to_probe_uncertain_fanout() -> None:
+    assert "do not refuse based on an unverified assumption" in _queen_role_colony
+    assert "launch one tiny probe worker" in _queen_role_colony
+
+
+def test_colony_prompt_preserves_latest_constraints_in_worker_skill() -> None:
+    assert "restate the latest user" in _queen_role_colony
+    assert "instructions override earlier task framing" in _queen_role_colony

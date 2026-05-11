@@ -22,6 +22,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -99,6 +100,25 @@ def _stub_executor(tool_use: ToolUse) -> ToolResult:
 # ---------------------------------------------------------------------------
 # Test
 # ---------------------------------------------------------------------------
+
+
+def test_run_parallel_workers_description_guides_probe_and_browser_inheritance() -> None:
+    """Tool prompt should prevent unverified claims about worker/browser sharing."""
+    session = SimpleNamespace(
+        colony=None,
+        id="description-test",
+        colony_runtime=None,
+        event_bus=None,
+        worker_path=None,
+        available_triggers={},
+        active_trigger_ids=set(),
+    )
+    registry = ToolRegistry()
+    register_queen_lifecycle_tools(registry, session=session, session_id=session.id)
+
+    description = registry.get_tools()["run_parallel_workers"].description
+    assert "Spawn a tiny probe worker first" in description
+    assert "may not inherit the queen's active browser tab" in description
 
 
 def _seed_tracker_registry(colony_id: str) -> None:
