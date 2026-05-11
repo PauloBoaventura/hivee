@@ -147,6 +147,51 @@ def _build_worker_loop_config(overrides: dict[str, Any]) -> Any:
 _DEFAULT_MAX_CONCURRENT_WORKERS = _env_int("HIVE_MAX_CONCURRENT_WORKERS", 4)
 
 
+# Token budget for the conversation-tail fallback used when a worker times
+# out without ever calling ``report_to_parent``. One assistant turn, capped
+# so a runaway message can't blow up the queen's stop_worker tool result.
+_STOP_TAIL_MAX_CHARS = 500
+
+
+async def _tail_last_assistant_message(worker: Any) -> str | None:
+    """Best-effort: read the worker's most recent non-empty assistant turn.
+
+    Returned excerpt is truncated to ``_STOP_TAIL_MAX_CHARS`` characters
+    (with an ellipsis suffix when truncated). Returns ``None`` when the
+    worker has no conversation store, no assistant turns, or the read
+    raises — the caller is the stop path and must never fail because of
+    a best-effort enrichment.
+
+    Reaches across ``worker._agent_loop._conversation_store`` deliberately:
+    the queen-stop path is the only caller and a defensive getattr is
+    cheaper than threading the store through Worker's public API for
+    one consumer.
+    """
+    try:
+        agent_loop = getattr(worker, "_agent_loop", None)
+        store = getattr(agent_loop, "_conversation_store", None)
+        if store is None:
+            return None
+        parts = await store.read_parts()
+        for part in reversed(parts):
+            if part.get("role") != "assistant":
+                continue
+            content = (part.get("content") or "").strip()
+            if not content:
+                continue
+            if len(content) > _STOP_TAIL_MAX_CHARS:
+                return content[:_STOP_TAIL_MAX_CHARS] + "…"
+            return content
+        return None
+    except Exception:
+        logger.debug(
+            "tail_last_assistant_message failed for %s",
+            getattr(worker, "id", "?"),
+            exc_info=True,
+        )
+        return None
+
+
 @dataclass
 class ColonyConfig:
     max_concurrent_workers: int = _DEFAULT_MAX_CONCURRENT_WORKERS
@@ -1420,13 +1465,16 @@ class ColonyRuntime:
         Each task spec is a dict ``{"task": str, "data": dict | None,
         "skills"?: list[str]}``. Workers start as independent asyncio
         background tasks and run concurrently; this method returns
-        their IDs immediately without waiting for completion. Use
-        ``wait_for_worker_reports(ids, timeout)`` to block until they
-        all finish.
+        their IDs immediately without waiting for completion.
 
         The overseer's ``run_parallel_workers`` tool is the usual
-        caller; it pairs ``spawn_batch`` + ``wait_for_worker_reports``
-        into a single fan-out/fan-in primitive.
+        caller: fire-and-forget, with each worker emitting a
+        ``SUBAGENT_REPORT`` event on termination that the queen
+        orchestrator turns into a ``[WORKER_REPORT]`` inject. Soft +
+        hard timeouts are enforced separately by ``watch_batch_timeouts``.
+        ``wait_for_worker_reports`` is only used by ``stop_worker`` now,
+        which blocks briefly to harvest reports before returning to the
+        queen.
 
         When ``tools_override`` is supplied, every spawned worker
         receives that tool list instead of the colony's default.  Used
@@ -1598,29 +1646,66 @@ class ColonyRuntime:
         finally:
             self._scoped_event_bus.unsubscribe(sub_id)
 
-        # Any still-pending workers are timed out — force-stop them and
-        # synthesise a timeout report.
+        # Any still-pending workers are timed out. Force-stop them, then
+        # prefer ``worker._result`` over a content-free timeout marker —
+        # ``Worker.run``'s CancelledError branch always populates ``_result``
+        # before returning, either with an explicit ``report_to_parent``
+        # payload that landed just before the cancel OR with the canned
+        # "Worker was cancelled before completion." fallback. Surfacing
+        # either is strictly more informative than a hardcoded
+        # "did not report within Ns" entry, which is what the caller
+        # actually needs to summarise what happened.
         for wid in list(pending_ids):
             try:
                 await self.stop_worker(wid)
             except Exception:
                 logger.exception("Failed to force-stop worker %s on timeout", wid)
             worker = self._workers.get(wid)
-            duration = 0.0
-            tokens = 0
-            if worker is not None and worker._started_at > 0:
-                duration = time.monotonic() - worker._started_at
-            if worker is not None and worker._result is not None:
-                tokens = worker._result.tokens_used
-            collected[wid] = {
-                "worker_id": wid,
-                "status": "timeout",
-                "summary": f"Worker did not report within {timeout:.0f}s.",
-                "data": {},
-                "error": "timeout",
-                "duration_seconds": duration,
-                "tokens_used": tokens,
-            }
+            result = worker._result if worker is not None else None
+            if result is not None:
+                data = dict(result.data) if result.data else {}
+                # When the worker was cancelled without ever calling
+                # ``report_to_parent`` (canned ``status="stopped"`` from
+                # the fallback branch), surface the tail of its on-disk
+                # conversation so the queen has SOMETHING to relay about
+                # where the worker was. Best-effort; never break the
+                # stop path on read failures.
+                if result.status == "stopped" and worker is not None:
+                    excerpt = await _tail_last_assistant_message(worker)
+                    if excerpt:
+                        data["last_assistant_excerpt"] = excerpt
+                collected[wid] = {
+                    "worker_id": wid,
+                    # Preserve the worker's own status: an explicit
+                    # ``report_to_parent(status='success'|'partial'|'failed')``
+                    # that raced in beats "timeout", and the canned
+                    # cancel path's ``status='stopped'`` is more honest
+                    # than "timeout" since the work did happen — it just
+                    # wasn't summarised in time.
+                    "status": result.status or "timeout",
+                    "summary": result.summary
+                    or f"Worker did not report within {timeout:.0f}s.",
+                    "data": data,
+                    "error": result.error or "timeout",
+                    "duration_seconds": result.duration_seconds,
+                    "tokens_used": result.tokens_used,
+                }
+            else:
+                # Worker handle is gone (e.g. stop_worker raised) — fall
+                # back to the synthetic entry so the caller still sees
+                # an item for every requested id.
+                duration = 0.0
+                if worker is not None and worker._started_at > 0:
+                    duration = time.monotonic() - worker._started_at
+                collected[wid] = {
+                    "worker_id": wid,
+                    "status": "timeout",
+                    "summary": f"Worker did not report within {timeout:.0f}s.",
+                    "data": {},
+                    "error": "timeout",
+                    "duration_seconds": duration,
+                    "tokens_used": 0,
+                }
             pending_ids.discard(wid)
 
         return [collected[wid] for wid in worker_ids]
@@ -1643,8 +1728,10 @@ class ColonyRuntime:
 
         In a queen DM session the overseer runs with 0 parallel workers.
         In a colony session she can spawn parallel workers via the
-        ``run_parallel_workers`` tool which calls ``spawn_batch`` +
-        ``wait_for_worker_reports`` under the hood.
+        ``run_parallel_workers`` tool which calls ``spawn_batch`` and
+        returns immediately; each spawned worker emits a
+        ``SUBAGENT_REPORT`` on termination that the queen orchestrator
+        injects back as a ``[WORKER_REPORT]`` turn.
 
         Pass ``seed_conversation`` to pre-populate the overseer's
         conversation history — used when forking a DM to a colony so

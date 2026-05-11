@@ -122,6 +122,45 @@ class Session:
     spawned_colony_name: str | None = None
 
 
+def _ensure_minimal_colony(colony_name: str, *, queen_name: str | None = None) -> Path:
+    """Bootstrap a minimal colony directory at ``~/.hive/colonies/{colony_name}/``.
+
+    Creates the directory, a ``metadata.json``, and a minimal ``worker.json``
+    so the colony is discoverable by the agent discovery system and colony-chat
+    can resolve it via ``agent_path``.  Returns the colony directory path.
+    """
+    from framework.config import COLONIES_DIR
+
+    colony_dir = COLONIES_DIR / colony_name
+    colony_dir.mkdir(parents=True, exist_ok=True)
+
+    meta_path = colony_dir / "metadata.json"
+    if not meta_path.exists():
+        meta: dict = {
+            "name": colony_name,
+            "created_at": time.time(),
+        }
+        if queen_name:
+            meta["queen_name"] = queen_name
+        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    # Minimal worker config so the colony dir is discoverable and
+    # colony-chat can find the session via agent_path.
+    worker_path = colony_dir / "worker.json"
+    if not worker_path.exists():
+        worker_config: dict = {
+            "name": colony_name.replace("_", " ").title(),
+            "description": f"Colony {colony_name}",
+            "tools": [],
+            "goal": {"description": f"Work on tasks for colony {colony_name}"},
+        }
+        if queen_name:
+            worker_config["queen_name"] = queen_name
+        worker_path.write_text(json.dumps(worker_config, indent=2), encoding="utf-8")
+
+    return colony_dir
+
+
 class SessionManager:
     """Manages session lifecycles.
 
@@ -296,6 +335,7 @@ class SessionManager:
         queen_resume_from: str | None = None,
         queen_name: str | None = None,
         initial_phase: str | None = None,
+        colony_name: str | None = None,
     ) -> Session:
         """Create a new session with a queen but no worker.
 
@@ -305,6 +345,12 @@ class SessionManager:
 
         When ``queen_name`` is set the session is pre-bound to that queen
         identity, skipping LLM auto-selection in the identity hook.
+
+        When ``colony_name`` is set, the session starts in colony mode: the
+        queen gets colony-phase tools (including ``run_parallel_workers``)
+        and a minimal colony directory is bootstrapped at
+        ``~/.hive/colonies/{colony_name}/``.  The caller does not need to
+        also set ``initial_phase`` — it is forced to ``"colony"``.
         """
         # Reuse the original session ID when cold-restoring
         resolved_session_id = queen_resume_from or session_id
@@ -312,6 +358,15 @@ class SessionManager:
         session.queen_resume_from = queen_resume_from
         if queen_name:
             session.queen_name = queen_name
+
+        # Colony-mode bootstrap: minimal on-disk colony + colony phase.
+        if colony_name:
+            colony_dir = _ensure_minimal_colony(colony_name, queen_name=queen_name)
+            session.colony_name = colony_name
+            session.colony_id = colony_name
+            session.worker_path = colony_dir
+            session.mode = "colony"
+            initial_phase = "colony"
 
         # Start queen immediately (queen-only, no worker tools yet)
         await self._start_queen(
@@ -322,9 +377,10 @@ class SessionManager:
         )
 
         logger.info(
-            "Session '%s' created (queen-only, resume_from=%s)",
+            "Session '%s' created (queen-only, resume_from=%s, colony=%s)",
             session.id,
             queen_resume_from,
+            colony_name,
         )
         return session
 

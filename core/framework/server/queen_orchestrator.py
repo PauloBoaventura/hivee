@@ -1055,6 +1055,19 @@ async def create_queen(
                     return
                 data = event.data or {}
                 worker_id = data.get("worker_id", event.node_id or "unknown")
+
+                # ``stop_worker`` collects reports synchronously via
+                # ``wait_for_worker_reports`` and returns them in its tool
+                # result. Re-injecting them here would double-up the same
+                # payload on the queen's next turn, so skip ids the tool
+                # has claimed.
+                colony_for_suppress = getattr(session, "colony", None)
+                suppress = getattr(
+                    colony_for_suppress, "_suppress_report_inject_for", None
+                )
+                if suppress and worker_id in suppress:
+                    return
+
                 status = data.get("status", "unknown")
                 summary = data.get("summary") or "(no summary)"
                 err = data.get("error")

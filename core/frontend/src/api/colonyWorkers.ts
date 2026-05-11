@@ -8,6 +8,13 @@ export interface WorkerResult {
   duration_seconds: number;
 }
 
+export interface TaskSummary {
+  total: number;
+  completed: number;
+  in_progress: number;
+  pending: number;
+}
+
 export interface WorkerSummary {
   worker_id: string;
   task: string;
@@ -19,6 +26,9 @@ export interface WorkerSummary {
    *  badge in the Sessions tab so the user can see which authorized
    *  account the worker is calling MCP tools as. */
   profile_name?: string;
+  /** Per-worker task progress counts. Null when the worker has no task
+   *  list or is not active (historical/stopped workers). */
+  task_summary?: TaskSummary | null;
 }
 
 export interface ColonySkill {

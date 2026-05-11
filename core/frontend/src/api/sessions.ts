@@ -10,16 +10,19 @@ import type {
 export const sessionsApi = {
   // --- Session lifecycle ---
 
-  /** Create a session. If agentPath is provided, loads a colony in one step. */
-  create: (agentPath?: string, agentId?: string, model?: string, initialPrompt?: string, queenResumeFrom?: string, initialPhase?: string, workerName?: string) =>
+  /** Create a session. If agentPath is provided, loads a colony in one step.
+   *  If colonyName is provided, starts the queen in colony mode with parallel agents. */
+  create: (opts?: { agentPath?: string; agentId?: string; model?: string; initialPrompt?: string; queenResumeFrom?: string; initialPhase?: string; workerName?: string; colonyName?: string; queenName?: string }) =>
     api.post<LiveSession>("/sessions", {
-      agent_path: agentPath,
-      agent_id: agentId,
-      model,
-      initial_prompt: initialPrompt,
-      queen_resume_from: queenResumeFrom || undefined,
-      initial_phase: initialPhase || undefined,
-      worker_name: workerName || undefined,
+      agent_path: opts?.agentPath,
+      agent_id: opts?.agentId,
+      model: opts?.model,
+      initial_prompt: opts?.initialPrompt,
+      queen_resume_from: opts?.queenResumeFrom || undefined,
+      initial_phase: opts?.initialPhase || undefined,
+      worker_name: opts?.workerName || undefined,
+      colony_name: opts?.colonyName || undefined,
+      queen_name: opts?.queenName || undefined,
     }),
 
   /** List all active sessions. */

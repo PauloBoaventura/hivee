@@ -116,11 +116,17 @@ async def handle_create_session(request: web.Request) -> web.Response:
         "model": "..." (optional),
         "initial_prompt": "..." (optional — first user message for the queen),
         "initial_phase": "..." (optional — "independent" for standalone queen),
+        "colony_name": "..." (optional — starts queen in colony mode with parallel agents),
     }
 
     When agent_path is provided, creates a session with a colony in one step
     (equivalent to the old POST /api/agents). Otherwise creates a queen-only
     session that can later have a colony loaded via POST /sessions/{id}/colony.
+
+    When colony_name is provided (without agent_path), creates a queen session
+    that starts in colony mode — the queen immediately has run_parallel_workers
+    and other colony-phase tools available. A minimal colony directory is
+    bootstrapped at ~/.hive/colonies/{colony_name}/.
     """
     from framework.agents.queen.queen_profiles import ensure_default_queens, load_queen_profile
     from framework.tools.queen_lifecycle_tools import QUEEN_PHASES, normalize_legacy_phase
@@ -144,6 +150,7 @@ async def handle_create_session(request: web.Request) -> web.Response:
     queen_name = body.get("queen_name")
     initial_phase = normalize_legacy_phase(body.get("initial_phase"))
     worker_name = body.get("worker_name")
+    colony_name = body.get("colony_name")
 
     if initial_phase is not None and initial_phase not in QUEEN_PHASES:
         return web.json_response(
@@ -180,7 +187,7 @@ async def handle_create_session(request: web.Request) -> web.Response:
                 worker_name=worker_name,
             )
         else:
-            # Queen-only session
+            # Queen-only session (optionally in colony mode)
             session = await manager.create_session(
                 session_id=session_id,
                 model=model,
@@ -188,6 +195,7 @@ async def handle_create_session(request: web.Request) -> web.Response:
                 queen_resume_from=queen_resume_from,
                 queen_name=queen_name,
                 initial_phase=initial_phase,
+                colony_name=colony_name,
             )
     except ValueError as e:
         msg = str(e)

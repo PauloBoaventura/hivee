@@ -1060,13 +1060,15 @@ export default function ChatPanel({
         msg.type !== "run_divider"
       ) {
         const workerMsgs: ChatMessage[] = [];
+        const interleavedUsers: ChatMessage[] = [];
         const firstWorkerMsg = msg;
 
         while (i < threadMessages.length) {
           const m = threadMessages[i];
 
-          // Hard boundary — stop the worker run group
-          if (m.type === "user" || m.type === "run_divider") break;
+          // Hard boundary — only run_divider ends a worker run.
+          // User messages are queen-bound and transparent to workers.
+          if (m.type === "run_divider") break;
           // Queen message with real text — boundary (queen is talking
           // to the user, not just emitting a tool)
           if (m.role === "queen" && m.content?.trim() && !m.type) break;
@@ -1089,6 +1091,14 @@ export default function ChatPanel({
             break;
           // Subagent message — different group type, stop here
           if (m.nodeId?.includes(":subagent:")) break;
+
+          // User messages are queen-bound — skip without breaking
+          // the worker run so subsequent deltas stay in the same bubble.
+          if (m.type === "user") {
+            interleavedUsers.push(m);
+            i++;
+            continue;
+          }
 
           // Worker text messages and worker tool_status belong to the run
           if (
@@ -1165,6 +1175,11 @@ export default function ChatPanel({
               group: { messages: workerMsgs },
             });
           }
+        }
+        // Emit queen-bound user messages that were interleaved
+        // with worker deltas so they still render in the chat.
+        for (const um of interleavedUsers) {
+          items.push({ kind: "message", msg: um });
         }
         continue;
       }

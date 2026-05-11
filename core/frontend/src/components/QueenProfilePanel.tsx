@@ -3,7 +3,7 @@ import { NavLink, useNavigate } from "react-router-dom";
 import { X, MessageSquare, Crown, ChevronRight, Briefcase, Award, Pencil, Check, Loader2, Camera, Plus } from "lucide-react";
 import { useColony } from "@/context/ColonyContext";
 import { queensApi, type QueenProfile } from "@/api/queens";
-import { executionApi } from "@/api/execution";
+import { sessionsApi } from "@/api/sessions";
 import { compressImage } from "@/lib/image-utils";
 import type { Colony } from "@/types/colony";
 import { slugToColonyId } from "@/lib/colony-registry";
@@ -123,9 +123,11 @@ export default function QueenProfilePanel({ queenId, colonies, onClose }: QueenP
     if (!cname || creatingColony) return;
     setCreatingColony(true);
     try {
-      // Create a fresh queen session, then fork it into a colony
-      const { session_id } = await queensApi.createNewSession(queenId, colonyTask.trim() || undefined);
-      await executionApi.colonySpawn(session_id, cname, colonyTask.trim() || undefined);
+      await sessionsApi.create({
+        colonyName: cname,
+        initialPrompt: colonyTask.trim() || undefined,
+        queenName: queenId,
+      });
       setColonyDialogOpen(false);
       setColonyName("");
       setColonyTask("");

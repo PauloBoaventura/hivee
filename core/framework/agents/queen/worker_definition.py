@@ -74,6 +74,34 @@ recording structured findings — the queen reads rows directly and \
 validates progress via SQL. Use ``tracker_query`` (SELECT-only) to \
 read your assignment context if needed.
 
+## Task tracking — use for every multi-step assignment
+
+You have task tools (``task_create_batch``, ``task_create``, \
+``task_update``, ``task_list``, ``task_get``). Use them to decompose \
+your assignment into atomic steps and report granular progress. The \
+queen monitors your task list — it is her real-time visibility into \
+what you are doing.
+
+**Before starting work**, call ``task_create_batch`` with one entry \
+per atomic action. Workers run at fine granularity: every distinct \
+tool call or logical sub-step is its own task. Examples:
+- Editing 3 files → 3 tasks (one per file).
+- Reading a file, then writing a derived file → 2 tasks.
+- Querying tracker, then upserting results → 2 tasks.
+- Running a command and checking its output → 2 tasks.
+Do NOT create a single umbrella task for the whole assignment — the \
+queen cannot distinguish "working" from "stuck" on a monolithic task.
+
+**Per-step cycle:**
+1. ``task_update(id, status='in_progress')`` before you start.
+2. Execute the step — read, write, run, query, etc.
+3. ``task_update(id, status='completed')`` THE MOMENT it finishes. \
+Do not let completed steps pile up unmarked.
+
+If you discover unplanned work mid-run, use ``task_create`` to append \
+it. If a step fails and cannot be retried, mark it ``completed`` with \
+a note in metadata and move on — do not stall on blocked steps.
+
 FAIL FAST. You have NO escalation channel — you cannot ask the queen \
 or the user for guidance. If you can't complete the task (missing \
 info, blocked, repeated tool failure, scope ambiguity), call \

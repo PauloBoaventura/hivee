@@ -16,8 +16,7 @@ import {
 import SidebarColonyItem from "./SidebarColonyItem";
 import SidebarQueenItem from "./SidebarQueenItem";
 import { useColony } from "@/context/ColonyContext";
-import { queensApi } from "@/api/queens";
-import { executionApi } from "@/api/execution";
+import { sessionsApi } from "@/api/sessions";
 import { slugToColonyId, sortQueenProfiles } from "@/lib/colony-registry";
 
 export default function Sidebar() {
@@ -42,8 +41,11 @@ export default function Sidebar() {
     if (!cname || !newColonyQueen || creatingColony) return;
     setCreatingColony(true);
     try {
-      const { session_id } = await queensApi.createNewSession(newColonyQueen, newColonyGoal.trim() || undefined);
-      await executionApi.colonySpawn(session_id, cname, newColonyGoal.trim() || undefined);
+      await sessionsApi.create({
+        colonyName: cname,
+        initialPrompt: newColonyGoal.trim() || undefined,
+        queenName: newColonyQueen,
+      });
       setCreateColonyOpen(false);
       setNewColonyQueen("");
       setNewColonyName("");

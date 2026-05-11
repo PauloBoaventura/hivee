@@ -64,17 +64,6 @@ export const executionApi = {
   goalProgress: (sessionId: string) =>
     api.get<GoalProgress>(`/sessions/${sessionId}/goal-progress`),
 
-  colonySpawn: (sessionId: string, colonyName: string, task?: string) =>
-    api.post<{
-      colony_path: string;
-      colony_name: string;
-      queen_session_id: string;
-      is_new: boolean;
-    }>(
-      `/sessions/${sessionId}/colony-spawn`,
-      { colony_name: colonyName, task },
-    ),
-
   /** Lock a queen DM session because the user opened a spawned colony.
    *  After this call /chat returns 409 until compactAndFork creates a new session.
    */

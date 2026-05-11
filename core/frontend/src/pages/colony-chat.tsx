@@ -419,15 +419,15 @@ export default function ColonyChat() {
 
   const loadSession = useCallback(async () => {
     if (loadingRef.current) return;
+    console.log("[colony-chat] loadSession called:", { agentPath, isNewChat });
     // For new chats without an agent, create a queen-only session
     if (!agentPath && isNewChat) {
       loadingRef.current = true;
       updateState({ loading: true, error: null, ready: false, sessionId: null });
       try {
-        const session = await sessionsApi.create(
-          undefined, undefined, undefined,
-          routeState.prompt || undefined,
-        );
+        const session = await sessionsApi.create({
+          initialPrompt: routeState.prompt || undefined,
+        });
         updateState({
           sessionId: session.session_id,
           displayName: "New Chat",
@@ -455,10 +455,15 @@ export default function ColonyChat() {
       // Check for existing live session for this agent
       try {
         const { sessions: allLive } = await sessionsApi.list();
-        const existing = allLive.find((s) => s.agent_path.endsWith(agentSlug(agentPath)));
+        const slug = agentSlug(agentPath);
+        console.log("[colony-chat] searching live sessions:", { slug, agentPath, liveCount: allLive.length, paths: allLive.map(s => s.agent_path) });
+        const existing = allLive.find((s) => s.agent_path.endsWith(slug));
         if (existing) {
+          console.log("[colony-chat] found existing live session:", existing.session_id, existing.queen_phase);
           liveSession = existing;
           isResumedSession = true;
+        } else {
+          console.log("[colony-chat] no live session found for slug:", slug);
         }
       } catch {
         // proceed
@@ -495,7 +500,12 @@ export default function ColonyChat() {
         }
 
         // Create new session (pass coldRestoreId for resume)
-        liveSession = await sessionsApi.create(agentPath, undefined, undefined, undefined, coldRestoreId ?? undefined);
+        console.log("[colony-chat] creating new session via agentPath:", agentPath);
+        liveSession = await sessionsApi.create({
+          agentPath,
+          queenResumeFrom: coldRestoreId ?? undefined,
+        });
+        console.log("[colony-chat] new session created:", liveSession.session_id, liveSession.queen_phase);
       }
 
       const session = liveSession!;
@@ -560,6 +570,7 @@ export default function ColonyChat() {
         serverPhase: session.queen_phase,
         hasWorker: session.has_worker,
       });
+      console.log("[colony-chat] resolved phase:", { initialPhase, serverPhase: session.queen_phase, hasWorker: session.has_worker, isResumedSession });
       queenPhaseRef.current = initialPhase;
 
       const hasRestoredContent = isResumedSession || !!coldRestoreId;
@@ -593,6 +604,7 @@ export default function ColonyChat() {
 
   // Load session on mount or when agent path changes
   useEffect(() => {
+    console.log("[colony-chat] loadSession effect:", { agentPath, isNewChat, colonyId, colonyFound: !!colony });
     if (agentPath || isNewChat) {
       // Reset state for new colony
       setMessages([]);

@@ -84,9 +84,9 @@ _QUEEN_COLONY_TOOLS = [
     # late-stage live-worker controls when something is clearly off.
     "get_worker_status",
     "inject_message",
-    "stop_worker",
-    # Fan out more tasks (live or post-run)
+    # Fan out workers
     "run_parallel_workers",
+    "stop_worker",
     # Skill authoring: write a colony-scoped skill so
     # run_parallel_workers can attach it to spawned workers (DRY:
     # protocol once in a skill, not duplicated across N task strings).

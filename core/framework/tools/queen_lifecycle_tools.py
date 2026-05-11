@@ -933,29 +933,102 @@ def register_queen_lifecycle_tools(
 
     # --- stop_worker -----------------------------------------------------------
 
-    async def stop_worker(*, reason: str = "Stopped by queen") -> str:
-        """Stop all active workers in the session.
+    async def stop_worker(
+        *,
+        reason: str = "Stopped by queen",
+        grace_seconds: float = 30.0,
+    ) -> str:
+        """Stop all active colony workers, giving them a window to report progress.
 
-        Stops workers on BOTH the unified ColonyRuntime (``session.colony``
-        — where ``run_agent_with_input`` and ``run_parallel_workers``
-        spawn) AND the legacy ``session.colony_runtime`` (loaded
-        AgentHost — still tracks timers and any legacy triggers). A
-        previous version only stopped the legacy runtime, which meant
-        workers spawned via the new path kept running silently after
-        the queen called this tool.
+        Each live worker first receives a ``[STOP REQUESTED]`` inject asking
+        it to call ``report_to_parent`` with whatever partial progress it has.
+        We then block for up to ``grace_seconds`` collecting those reports via
+        ``colony.wait_for_worker_reports`` — workers that report in time get
+        their explicit summary preserved; workers that don't are force-stopped
+        and their report is synthesised with ``status="timeout"``.
+
+        The collected reports are returned in the tool result so the queen
+        can summarise what actually happened in the same turn, instead of
+        falling back to information from a prior turn.
+
+        ``grace_seconds=0`` skips the wait and hard-stops immediately.
         """
-        stopped_unified = 0
+        colony = getattr(session, "colony", None)
+        legacy = _get_runtime()
+
+        if colony is None and legacy is None:
+            return json.dumps({"error": "No runtime on this session."})
+
+        reports: list[dict[str, Any]] = []
+        live_ids: list[str] = []
         errors: list[str] = []
 
-        # 1. Stop everything on the unified ColonyRuntime. This is
-        # where run_agent_with_input and run_parallel_workers live.
-        colony = getattr(session, "colony", None)
         if colony is not None:
             try:
-                # Count live workers BEFORE stopping so we can report
-                # accurately — stop_all_workers clears the dict.
-                stopped_unified = sum(1 for w in colony.list_workers() if w.status.value in ("pending", "running"))
-                await colony.stop_all_workers()
+                # Snapshot live worker ids BEFORE injecting — wait_for_worker_reports
+                # / stop_all_workers mutate the registry, so we need a stable list
+                # to report on.
+                live_ids = [
+                    info.id
+                    for info in colony.list_workers()
+                    if info.status.value in ("pending", "running")
+                ]
+
+                if live_ids:
+                    # Claim these workers' SUBAGENT_REPORT events so the
+                    # orchestrator's [WORKER_REPORT] inject path skips
+                    # them — we're returning the reports synchronously
+                    # in this tool's result, so a duplicate inject on
+                    # the next turn would just be noise. Set is attached
+                    # to the colony (same object the orchestrator reads)
+                    # and updated BEFORE the stop inject so a worker
+                    # that finishes mid-handshake still gets suppressed.
+                    claimed = getattr(colony, "_suppress_report_inject_for", None)
+                    if claimed is None:
+                        claimed = set()
+                        try:
+                            colony._suppress_report_inject_for = claimed
+                        except AttributeError:
+                            claimed = None
+                    if claimed is not None:
+                        claimed.update(live_ids)
+
+                    grace = max(0.0, grace_seconds)
+                    stop_msg = (
+                        f"[STOP REQUESTED] {reason}. Call report_to_parent "
+                        "immediately with your latest progress, decisions, "
+                        "and partial findings. You have "
+                        f"~{grace:.0f}s before a hard stop — anything not "
+                        "reported by then will be lost."
+                    )
+                    for wid in live_ids:
+                        worker = colony.get_worker(wid)
+                        if worker is None or not worker.is_active:
+                            continue
+                        # Worker may have just filed a report on its own;
+                        # don't nudge a finished worker into emitting a
+                        # redundant turn.
+                        if getattr(worker, "_explicit_report", None) is not None:
+                            continue
+                        try:
+                            await colony.send_to_worker(wid, stop_msg)
+                        except Exception:
+                            logger.warning(
+                                "stop_worker: stop-inject failed for %s",
+                                wid,
+                                exc_info=True,
+                            )
+
+                    if grace > 0:
+                        # Blocks until each id reports OR the deadline hits;
+                        # on timeout the helper force-stops the laggard and
+                        # synthesises a ``status="timeout"`` entry, so every
+                        # id in ``live_ids`` appears in the returned list.
+                        reports = await colony.wait_for_worker_reports(
+                            live_ids, timeout=grace
+                        )
+                    else:
+                        await colony.stop_all_workers()
             except Exception as e:
                 errors.append(f"unified: {e}")
                 logger.warning(
@@ -963,98 +1036,79 @@ def register_queen_lifecycle_tools(
                     exc_info=True,
                 )
 
-        # 2. Stop the legacy runtime too (timers, old-path workers).
-        legacy = _get_runtime()
+        # Workers themselves live on the unified ColonyRuntime above; the
+        # queen's own AgentHost runtime is kept only for timer-based triggers,
+        # so this branch is just "pause the cron timers".
+        timers_paused = False
         if legacy is not None:
             try:
-                legacy_workers = legacy.list_workers()
-                _ = len(legacy_workers) if isinstance(legacy_workers, list) else 0
-            except Exception as e:
-                errors.append(f"legacy: {e}")
-                logger.warning(
-                    "stop_worker: failed to stop legacy runtime workers",
-                    exc_info=True,
-                )
-
-        if colony is None and legacy is None:
-            return json.dumps({"error": "No runtime on this session."})
-
-        cancelled: list[str] = []
-        cancelling: list[str] = []
-
-        # 3. Stop legacy runtime executions with per-stream cancellation so a
-        # still-alive task keeps the worker in "cancelling" instead of being
-        # reported as fully stopped too early.
-        if legacy is not None:
-            try:
-                for graph_id in legacy.list_graphs():
-                    reg = legacy.get_graph_registration(graph_id)
-                    if reg is None:
-                        continue
-
-                    for _ep_id, stream in reg.streams.items():
-                        for executor in stream._active_executors.values():
-                            for node in executor.node_registry.values():
-                                if hasattr(node, "signal_shutdown"):
-                                    node.signal_shutdown()
-                                if hasattr(node, "cancel_current_turn"):
-                                    node.cancel_current_turn()
-
-                        for exec_id in list(stream.active_execution_ids):
-                            try:
-                                outcome = await stream.cancel_execution(exec_id, reason=reason)
-                                if outcome == "cancelled":
-                                    cancelled.append(exec_id)
-                                elif outcome == "cancelling":
-                                    cancelling.append(exec_id)
-                            except Exception as e:
-                                errors.append(f"legacy-cancel:{exec_id}: {e}")
-                                logger.warning("Failed to cancel %s: %s", exec_id, e)
-
                 legacy.pause_timers()
+                timers_paused = True
             except Exception as e:
-                errors.append(f"legacy-runtime: {e}")
+                errors.append(f"pause_timers: {e}")
                 logger.warning(
-                    "stop_worker: failed to inspect legacy runtime executions",
+                    "stop_worker: pause_timers failed",
                     exc_info=True,
                 )
 
-        total_stopped = stopped_unified + len(cancelled)
         logger.info(
-            "stop_worker: status=%s (unified=%d, cancelled=%d, cancelling=%d). reason=%s",
-            "cancelling" if cancelling else "stopped" if total_stopped else "no_active_executions",
-            stopped_unified,
-            len(cancelled),
-            len(cancelling),
+            "stop_worker: stopped %d worker(s), %d report(s) collected. reason=%s",
+            len(live_ids),
+            len(reports),
             reason,
         )
 
         return json.dumps(
             {
-                "status": ("cancelling" if cancelling else "stopped" if total_stopped else "no_active_executions"),
-                "workers_stopped": total_stopped,
-                "unified_stopped": stopped_unified,
-                "legacy_stopped": len(cancelled),
-                "cancelled": cancelled,
-                "cancelling": cancelling,
-                "timers_paused": legacy is not None,
+                "status": "stopped" if live_ids else "no_active_workers",
+                "workers_stopped": len(live_ids),
+                "reports": reports,
+                "timers_paused": timers_paused,
                 "reason": reason,
                 "errors": errors if errors else None,
             }
         )
 
-    def _stop_result_allows_phase_transition(stop_result: str) -> tuple[dict, bool]:
-        result = json.loads(stop_result)
-        return result, result.get("status") != "cancelling"
-
     _stop_tool = Tool(
         name="stop_worker",
         description=(
-            "Cancel all active colony workers and pause timers. Workers stop gracefully. No parameters needed."
+            "Cancel all active colony workers and pause timers. Each live "
+            "worker first receives a [STOP REQUESTED] inject asking it to "
+            "call report_to_parent with its latest progress; workers that "
+            "do not report within `grace_seconds` are force-stopped. The "
+            "collected reports are returned in the tool result so you can "
+            "summarize what actually happened in this turn instead of "
+            "guessing from prior turns. Defaults to a 30s grace window; "
+            "pass 0 for an immediate hard stop."
         ),
-        parameters={"type": "object", "properties": {}},
+        parameters={
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "Why the workers are being stopped. Surfaced to "
+                        "each worker in the stop inject so its final "
+                        "report_to_parent call can reflect the cause."
+                    ),
+                },
+                "grace_seconds": {
+                    "type": "number",
+                    "description": (
+                        "Seconds to wait for workers to file a "
+                        "report_to_parent before force-stopping. "
+                        "Defaults to 30; set to 0 for an immediate hard stop."
+                    ),
+                },
+            },
+            "required": [],
+        },
     )
-    registry.register("stop_worker", _stop_tool, lambda inputs: stop_worker())
+    registry.register(
+        "stop_worker",
+        _stop_tool,
+        lambda inputs: stop_worker(**inputs),
+    )
     tools_registered += 1
 
     # --- run_parallel_workers --------------------------------------------------
@@ -2941,94 +2995,6 @@ def register_queen_lifecycle_tools(
     )
     tools_registered += 1
 
-
-    # --- stop_worker_and_review --------------------------------------------------
-
-    async def stop_worker_and_review() -> str:
-        """Stop the loaded graph and switch to building phase for editing the agent."""
-        stop_result = await stop_worker()
-        result, can_transition = _stop_result_allows_phase_transition(stop_result)
-
-        # Switch to building phase
-        if phase_state is not None and can_transition:
-            await phase_state.switch_to_building()
-            _update_meta_json(session_manager, manager_session_id, {"phase": "building"})
-
-        if can_transition:
-            result["phase"] = "building"
-            result["message"] = (
-                "Graph stopped. You are now in building phase. "
-                "Use your coding tools to modify the agent, then call "
-                "load_built_agent(path) to stage it again."
-            )
-        else:
-            result["message"] = (
-                "Stop requested, but the worker is still shutting down. Phase will not change until shutdown completes."
-            )
-        # Nudge the queen to start coding instead of blocking for user input.
-        if can_transition and phase_state is not None and phase_state.inject_notification:
-            await phase_state.inject_notification(
-                "[PHASE CHANGE] Switched to BUILDING phase. Start implementing the changes now."
-            )
-        return json.dumps(result)
-
-    _stop_edit_tool = Tool(
-        name="stop_worker_and_review",
-        description=(
-            "Stop the running graph and switch to building phase. "
-            "Use this when you need to modify the agent's code, nodes, or configuration. "
-            "After editing, call load_built_agent(path) to reload and run."
-        ),
-        parameters={"type": "object", "properties": {}},
-    )
-    # NOTE: ``stop_worker_and_review`` is intentionally NOT registered. The
-    # phase transition method ``phase_state.switch_to_building`` it would
-    # invoke is no longer defined since the planning/building pipeline was
-    # removed; the wrapper is left here as a stub for future reintroduction.
-    _ = _stop_edit_tool
-
-    # --- stop_worker (Running → Staging) --------------------------------------
-
-    async def stop_worker_to_staging() -> str:
-        """Stop the running graph and switch to staging phase.
-
-        After stopping, ask the user whether they want to:
-        1. Re-run the agent with new input → call run_agent_with_input(task)
-        2. Edit the agent code → call stop_worker_and_review() to go to building phase
-        """
-        stop_result = await stop_worker()
-        result, can_transition = _stop_result_allows_phase_transition(stop_result)
-
-        # Switch to staging phase
-        if phase_state is not None and can_transition:
-            await phase_state.switch_to_staging()
-            _update_meta_json(session_manager, manager_session_id, {"phase": "staging"})
-
-        if can_transition:
-            result["phase"] = "staging"
-            result["message"] = (
-                "Graph stopped. You are now in staging phase. "
-                "Ask the user: would they like to re-run with new input, "
-                "or edit the agent code?"
-            )
-        else:
-            result["message"] = (
-                "Stop requested, but the worker is still shutting down. "
-                "Stay in the current phase until shutdown completes."
-            )
-        return json.dumps(result)
-
-    _stop_worker_tool = Tool(
-        name="stop_worker",
-        description=(
-            "Stop the running graph and switch to staging phase. "
-            "After stopping, ask the user whether they want to re-run "
-            "with new input or edit the agent code."
-        ),
-        parameters={"type": "object", "properties": {}},
-    )
-    registry.register("stop_worker", _stop_worker_tool, lambda inputs: stop_worker_to_staging())
-    tools_registered += 1
 
     # --- get_worker_status -----------------------------------------------------
 

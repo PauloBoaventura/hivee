@@ -101,6 +101,26 @@ async def handle_list_workers(request: web.Request) -> web.Response:
     if storage_path is not None:
         workers.extend(await asyncio.to_thread(_walk_historical_workers, storage_path, known_ids))
 
+    # Attach task progress summaries for active workers.
+    from framework.tasks.store import get_task_store
+
+    _ACTIVE_STATUSES = frozenset({"pending", "running", "queued"})
+    store = get_task_store()
+    for w in workers:
+        if w["status"] not in _ACTIVE_STATUSES:
+            continue
+        tlid = f"session:{w['worker_id']}:{w['worker_id']}"
+        try:
+            tasks = await store.list_tasks(tlid)
+            w["task_summary"] = {
+                "total": len(tasks),
+                "completed": sum(1 for t in tasks if t.status.value == "completed"),
+                "in_progress": sum(1 for t in tasks if t.status.value == "in_progress"),
+                "pending": sum(1 for t in tasks if t.status.value == "pending"),
+            }
+        except Exception:
+            w["task_summary"] = None
+
     return web.json_response({"workers": workers})
 
 

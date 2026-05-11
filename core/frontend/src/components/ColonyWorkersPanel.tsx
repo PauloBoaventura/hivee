@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   X,
   Users,
@@ -6,6 +6,7 @@ import {
   Wrench,
   ChevronRight,
   ChevronDown,
+  ChevronUp,
   ArrowLeft,
   Square,
   Play,
@@ -24,6 +25,7 @@ import {
   colonyWorkersApi,
   type ColonySkill,
   type ColonyTool,
+  type TaskSummary,
   type WorkerSummary,
 } from "@/api/colonyWorkers";
 import { coloniesApi, type WorkerProfile } from "@/api/colonies";
@@ -36,10 +38,14 @@ import {
 } from "@/api/colonyData";
 import { workersApi } from "@/api/workers";
 import { sessionsApi } from "@/api/sessions";
+import type { AgentEvent } from "@/api/types";
+import { useSSE } from "@/hooks/use-sse";
 import { cronToLabel } from "@/lib/graphUtils";
 import type { GraphNode } from "@/components/graph-types";
 import { useColonyWorkers } from "@/context/ColonyWorkersContext";
 import TaskListPanel from "@/components/TaskListPanel";
+import { ToolActivityRow } from "@/components/ChatPanel";
+import { workerIdFromStreamId } from "@/lib/chat-helpers";
 
 // Re-export so the WorkerDetail block can use it without forward decl.
 const TaskListPanelLazy = TaskListPanel;
@@ -482,6 +488,185 @@ function ToolGroup({ label, items }: { label: string; items: ColonyTool[] }) {
   );
 }
 
+// ── Worker task progress (SSE-driven) ────────────────────────────────
+
+const TASK_EVENT_TYPES = [
+  "task_created",
+  "task_updated",
+  "task_deleted",
+  "task_list_reset",
+] as const;
+
+function workerIdFromTaskListId(taskListId: string): string | null {
+  if (!taskListId.startsWith("session:")) return null;
+  const rest = taskListId.slice("session:".length);
+  const idx = rest.indexOf(":");
+  if (idx <= 0) return null;
+  const agentId = rest.slice(0, idx);
+  const sessId = rest.slice(idx + 1);
+  return agentId === sessId ? agentId : null;
+}
+
+const EMPTY_SUMMARY: TaskSummary = { total: 0, completed: 0, in_progress: 0, pending: 0 };
+
+function useWorkerTaskProgress(
+  sessionId: string | null,
+  workers: WorkerSummary[],
+): Map<string, TaskSummary> {
+  const progressRef = useRef<Map<string, TaskSummary>>(new Map());
+  const [, tick] = useState(0);
+
+  // Seed from REST poll data.
+  for (const w of workers) {
+    if (w.task_summary) {
+      progressRef.current.set(w.worker_id, w.task_summary);
+    }
+  }
+
+  const onEvent = useCallback(
+    (ev: AgentEvent) => {
+      const data = ev.data ?? {};
+      const tlid = (data as { task_list_id?: string }).task_list_id;
+      if (!tlid) return;
+      const wid = workerIdFromTaskListId(tlid);
+      if (!wid) return;
+
+      const cur = progressRef.current.get(wid) ?? { ...EMPTY_SUMMARY };
+
+      switch (ev.type) {
+        case "task_created": {
+          const s = ((data as { task?: { status?: string } }).task?.status) ?? "pending";
+          progressRef.current.set(wid, {
+            total: cur.total + 1,
+            completed: cur.completed + (s === "completed" ? 1 : 0),
+            in_progress: cur.in_progress + (s === "in_progress" ? 1 : 0),
+            pending: cur.pending + (s === "pending" ? 1 : 0),
+          });
+          break;
+        }
+        case "task_updated": {
+          const after = ((data as { after?: { status?: string } }).after?.status) ?? "pending";
+          if (after === "completed") {
+            progressRef.current.set(wid, {
+              ...cur,
+              completed: cur.completed + 1,
+              in_progress: Math.max(0, cur.in_progress - 1),
+            });
+          } else if (after === "in_progress") {
+            progressRef.current.set(wid, {
+              ...cur,
+              in_progress: cur.in_progress + 1,
+              pending: Math.max(0, cur.pending - 1),
+            });
+          }
+          break;
+        }
+        case "task_deleted": {
+          progressRef.current.set(wid, { ...cur, total: Math.max(0, cur.total - 1) });
+          break;
+        }
+        case "task_list_reset": {
+          progressRef.current.set(wid, { ...EMPTY_SUMMARY });
+          break;
+        }
+      }
+      tick((n) => n + 1);
+    },
+    [],
+  );
+
+  useSSE({
+    sessionId: sessionId ?? "",
+    eventTypes: TASK_EVENT_TYPES as unknown as AgentEvent["type"][],
+    enabled: Boolean(sessionId),
+    onEvent,
+  });
+
+  return progressRef.current;
+}
+
+function WorkerTaskProgressBar({ summary }: { summary: TaskSummary | null | undefined }) {
+  if (!summary || summary.total === 0) return null;
+  const pct = Math.round((summary.completed / summary.total) * 100);
+  return (
+    <div className="flex items-center gap-1.5 mt-1">
+      <div className="flex-1 h-1.5 rounded-full bg-muted/50 overflow-hidden">
+        <div
+          className="h-full rounded-full bg-emerald-500/80 transition-all duration-300"
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+      <span className="text-[10px] text-muted-foreground tabular-nums whitespace-nowrap">
+        {summary.completed}/{summary.total}
+        {summary.in_progress > 0 && (
+          <span className="text-primary ml-0.5">({summary.in_progress} active)</span>
+        )}
+      </span>
+    </div>
+  );
+}
+
+// ── Per-worker tool tracking (SSE-driven) ──────────────────────────────
+
+interface ToolProgress {
+  tools: { name: string; done: boolean; callKey: string }[];
+  allDone: boolean;
+}
+
+const TOOL_EVENT_TYPES = [
+  "tool_call_started",
+  "tool_call_completed",
+  "execution_started",
+] as const;
+
+function useWorkerToolProgress(sessionId: string | null): Map<string, ToolProgress> {
+  const toolsRef = useRef<Map<string, ToolProgress>>(new Map());
+  const [, tick] = useState(0);
+
+  const onEvent = useCallback((ev: AgentEvent) => {
+    const streamId = ev.stream_id;
+    const workerId = workerIdFromStreamId(streamId);
+    if (!workerId) return;
+
+    switch (ev.type) {
+      case "execution_started": {
+        toolsRef.current.set(workerId, { tools: [], allDone: false });
+        tick((n) => n + 1);
+        break;
+      }
+      case "tool_call_started": {
+        const toolName = (ev.data?.tool_name as string) || "unknown";
+        const toolUseId = (ev.data?.tool_use_id as string) || "";
+        const cur = toolsRef.current.get(workerId) ?? { tools: [], allDone: false };
+        cur.tools.push({ name: toolName, done: false, callKey: toolUseId });
+        cur.allDone = false;
+        toolsRef.current.set(workerId, cur);
+        tick((n) => n + 1);
+        break;
+      }
+      case "tool_call_completed": {
+        const toolUseId = (ev.data?.tool_use_id as string) || "";
+        const cur = toolsRef.current.get(workerId);
+        if (!cur) break;
+        const entry = cur.tools.find((t) => t.callKey === toolUseId && !t.done);
+        if (entry) entry.done = true;
+        cur.allDone = cur.tools.length > 0 && cur.tools.every((t) => t.done);
+        tick((n) => n + 1);
+        break;
+      }
+    }
+  }, []);
+
+  useSSE({
+    sessionId: sessionId ?? "",
+    eventTypes: TOOL_EVENT_TYPES as unknown as AgentEvent["type"][],
+    enabled: Boolean(sessionId),
+    onEvent,
+  });
+
+  return toolsRef.current;
+}
+
 // ── Sessions tab ───────────────────────────────────────────────────────
 
 function SessionsTab({
@@ -610,9 +795,102 @@ function SessionsTab({
   }
 
   const activeCount = activeWorkers.length;
+  const toolProgress = useWorkerToolProgress(sessionId);
 
-  const renderCard = (w: WorkerSummary, active: boolean) => (
-    <li key={w.worker_id}>
+  return (
+    <TabShell
+      loading={loading}
+      error={error}
+      onRefresh={refresh}
+      empty={workers.length === 0 ? "No workers spawned yet." : null}
+      headerRight={
+        activeCount > 0 ? (
+          <button
+            onClick={stopAll}
+            disabled={stoppingAll}
+            className="text-[10px] px-2 py-0.5 rounded border border-destructive/40 text-destructive hover:bg-destructive/10 disabled:opacity-50 transition-colors"
+            title={`Stop ${activeCount} active worker${activeCount === 1 ? "" : "s"}`}
+          >
+            {stoppingAll ? "Stopping…" : `Stop all (${activeCount})`}
+          </button>
+        ) : null
+      }
+    >
+      <div className="flex flex-col gap-3">
+        {activeWorkers.length > 0 && (
+          <section>
+            <h4 className="text-[10px] uppercase tracking-wide font-semibold text-primary mb-1.5 flex items-center gap-1.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
+              Active ({activeWorkers.length})
+            </h4>
+            <ul className="flex flex-col gap-1.5">
+              {activeWorkers.map((w) => (
+                <WorkerCard
+                  key={w.worker_id}
+                  w={w}
+                  active
+                  stoppingId={stoppingId}
+                  onSelect={() => setSelected(w.worker_id)}
+                  onStop={() => stopOne(w.worker_id)}
+                  toolProgress={toolProgress.get(w.worker_id)}
+                />
+              ))}
+            </ul>
+          </section>
+        )}
+        {historyWorkers.length > 0 && (
+          <section>
+            <h4 className="text-[10px] uppercase tracking-wide font-semibold text-muted-foreground mb-1.5">
+              History ({historyWorkers.length})
+            </h4>
+            <ul className="flex flex-col gap-1.5">
+              {historyWorkers.map((w) => (
+                <WorkerCard
+                  key={w.worker_id}
+                  w={w}
+                  active={false}
+                  stoppingId={stoppingId}
+                  onSelect={() => setSelected(w.worker_id)}
+                  onStop={() => stopOne(w.worker_id)}
+                  toolProgress={toolProgress.get(w.worker_id)}
+                />
+              ))}
+            </ul>
+          </section>
+        )}
+      </div>
+    </TabShell>
+  );
+}
+
+function isWorkerActive(w: WorkerSummary): boolean {
+  const s = (w.status || "").toLowerCase();
+  return s === "pending" || s === "running";
+}
+
+// ── Worker card (memo'd component for tool expansion) ─────────────────
+
+const WorkerCard = memo(function WorkerCard({
+  w,
+  active,
+  stoppingId,
+  onSelect,
+  onStop,
+  toolProgress,
+}: {
+  w: WorkerSummary;
+  active: boolean;
+  stoppingId: string | null;
+  onSelect: () => void;
+  onStop: () => void;
+  toolProgress: ToolProgress | undefined;
+}) {
+  const [toolsExpanded, setToolsExpanded] = useState(false);
+  const toolCount = toolProgress?.tools.length ?? 0;
+  const doneCount = toolProgress?.tools.filter((t) => t.done).length ?? 0;
+
+  return (
+    <li>
       <div
         className={`rounded-lg border transition-colors ${
           active
@@ -621,7 +899,7 @@ function SessionsTab({
         }`}
       >
         <button
-          onClick={() => setSelected(w.worker_id)}
+          onClick={onSelect}
           className="w-full text-left px-3 py-2.5"
         >
           <div className="flex items-center justify-between mb-1 gap-2">
@@ -670,12 +948,54 @@ function SessionsTab({
             )}
           </div>
         </button>
+
+        {toolCount > 0 && (
+          <div className="border-t border-border/30 px-3 py-1.5">
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setToolsExpanded((v) => !v);
+              }}
+              className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground transition-colors w-full"
+            >
+              <Wrench className="w-3 h-3 flex-shrink-0" />
+              <span className="tabular-nums">
+                {doneCount}/{toolCount} tools
+              </span>
+              {!toolProgress?.allDone && (
+                <span className="text-primary ml-0.5">(running)</span>
+              )}
+              <span className="ml-auto">
+                {toolsExpanded ? (
+                  <ChevronUp className="w-3 h-3" />
+                ) : (
+                  <ChevronDown className="w-3 h-3" />
+                )}
+              </span>
+            </button>
+            {toolsExpanded && toolProgress && (
+              <div className="mt-1.5">
+                <ToolActivityRow
+                  content={JSON.stringify({
+                    tools: toolProgress.tools.map((t) => ({
+                      name: t.name,
+                      done: t.done,
+                    })),
+                    allDone: toolProgress.allDone,
+                  })}
+                />
+              </div>
+            )}
+          </div>
+        )}
+
         {active && (
           <div className="border-t border-primary/20 px-3 py-1.5 flex justify-end">
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                stopOne(w.worker_id);
+                onStop();
               }}
               disabled={stoppingId === w.worker_id}
               className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-destructive/40 text-destructive text-[10px] hover:bg-destructive/10 disabled:opacity-50 transition-colors"
@@ -689,57 +1009,7 @@ function SessionsTab({
       </div>
     </li>
   );
-
-  return (
-    <TabShell
-      loading={loading}
-      error={error}
-      onRefresh={refresh}
-      empty={workers.length === 0 ? "No workers spawned yet." : null}
-      headerRight={
-        activeCount > 0 ? (
-          <button
-            onClick={stopAll}
-            disabled={stoppingAll}
-            className="text-[10px] px-2 py-0.5 rounded border border-destructive/40 text-destructive hover:bg-destructive/10 disabled:opacity-50 transition-colors"
-            title={`Stop ${activeCount} active worker${activeCount === 1 ? "" : "s"}`}
-          >
-            {stoppingAll ? "Stopping…" : `Stop all (${activeCount})`}
-          </button>
-        ) : null
-      }
-    >
-      <div className="flex flex-col gap-3">
-        {activeWorkers.length > 0 && (
-          <section>
-            <h4 className="text-[10px] uppercase tracking-wide font-semibold text-primary mb-1.5 flex items-center gap-1.5">
-              <span className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
-              Active ({activeWorkers.length})
-            </h4>
-            <ul className="flex flex-col gap-1.5">
-              {activeWorkers.map((w) => renderCard(w, true))}
-            </ul>
-          </section>
-        )}
-        {historyWorkers.length > 0 && (
-          <section>
-            <h4 className="text-[10px] uppercase tracking-wide font-semibold text-muted-foreground mb-1.5">
-              History ({historyWorkers.length})
-            </h4>
-            <ul className="flex flex-col gap-1.5">
-              {historyWorkers.map((w) => renderCard(w, false))}
-            </ul>
-          </section>
-        )}
-      </div>
-    </TabShell>
-  );
-}
-
-function isWorkerActive(w: WorkerSummary): boolean {
-  const s = (w.status || "").toLowerCase();
-  return s === "pending" || s === "running";
-}
+});
 
 // ── Triggers tab ───────────────────────────────────────────────────────
 
