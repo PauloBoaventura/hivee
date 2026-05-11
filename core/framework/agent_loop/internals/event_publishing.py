@@ -186,6 +186,17 @@ async def publish_context_usage(
     estimated = conversation.estimate_tokens()
     max_tokens = conversation._max_context_tokens
     ratio = estimated / max_tokens if max_tokens > 0 else 0.0
+    # Diagnostic for "why does the UI show window=X?" — single line at the
+    # final emission boundary so future regressions on context_usage_updated
+    # can be traced without re-instrumenting the agent loop.
+    logger.debug(
+        "context_usage emit agent=%s trigger=%s max=%d estimated=%d msgs=%d",
+        ctx.agent_id,
+        trigger,
+        max_tokens,
+        estimated,
+        conversation.message_count,
+    )
     await event_bus.publish(
         AgentEvent(
             type=EventType.CONTEXT_USAGE_UPDATED,

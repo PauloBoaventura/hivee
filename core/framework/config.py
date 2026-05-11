@@ -319,11 +319,46 @@ def get_worker_llm_extra_kwargs() -> dict[str, Any]:
     return {}
 
 
+DEFAULT_MAX_CONTEXT_TOKENS = 32_000
+OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
+
+
+def _catalog_limits_for(llm_section: dict[str, Any]) -> tuple[int, int] | None:
+    """Look up ``(max_tokens, max_context_tokens)`` for the configured model.
+
+    Resolves the provider/model pair from a ``llm`` (or ``worker_llm``)
+    config section against the curated model catalog. Used as a fallback
+    when the config itself doesn't pin these limits — picking a model in
+    the UI writes only ``provider`` + ``model``, so without this lookup
+    every limit collapses to the hardcoded defaults (32k context, 8k
+    output) regardless of the model's real window.
+    """
+    provider = llm_section.get("provider")
+    model = llm_section.get("model")
+    if not provider or not model:
+        return None
+    try:
+        from framework.llm.model_catalog import get_model_limits
+
+        # OpenRouter quickstart stores raw model IDs that may include the
+        # ``openrouter/`` prefix when round-tripped through display code.
+        # Strip it for the catalog lookup (catalog keys are bare ids).
+        if str(provider).lower() == "openrouter" and str(model).lower().startswith("openrouter/"):
+            model = str(model)[len("openrouter/"):]
+        return get_model_limits(str(provider), str(model))
+    except Exception:
+        return None
+
+
 def get_worker_max_tokens() -> int:
     """Return max_tokens for the worker LLM, falling back to default."""
     worker_llm = get_hive_config().get("worker_llm", {})
     if worker_llm and "max_tokens" in worker_llm:
         return worker_llm["max_tokens"]
+    if worker_llm:
+        catalog = _catalog_limits_for(worker_llm)
+        if catalog is not None:
+            return catalog[0]
     return get_max_tokens()
 
 
@@ -332,21 +367,35 @@ def get_worker_max_context_tokens() -> int:
     worker_llm = get_hive_config().get("worker_llm", {})
     if worker_llm and "max_context_tokens" in worker_llm:
         return worker_llm["max_context_tokens"]
+    if worker_llm:
+        catalog = _catalog_limits_for(worker_llm)
+        if catalog is not None:
+            return catalog[1]
     return get_max_context_tokens()
 
 
 def get_max_tokens() -> int:
-    """Return the configured max_tokens, falling back to DEFAULT_MAX_TOKENS."""
-    return get_hive_config().get("llm", {}).get("max_tokens", DEFAULT_MAX_TOKENS)
-
-
-DEFAULT_MAX_CONTEXT_TOKENS = 32_000
-OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
+    """Return the configured max_tokens, falling back to the model's catalog
+    entry, then DEFAULT_MAX_TOKENS."""
+    llm = get_hive_config().get("llm", {})
+    if "max_tokens" in llm:
+        return llm["max_tokens"]
+    catalog = _catalog_limits_for(llm)
+    if catalog is not None:
+        return catalog[0]
+    return DEFAULT_MAX_TOKENS
 
 
 def get_max_context_tokens() -> int:
-    """Return the configured max_context_tokens, falling back to DEFAULT_MAX_CONTEXT_TOKENS."""
-    return get_hive_config().get("llm", {}).get("max_context_tokens", DEFAULT_MAX_CONTEXT_TOKENS)
+    """Return the configured max_context_tokens, falling back to the model's
+    catalog entry, then DEFAULT_MAX_CONTEXT_TOKENS."""
+    llm = get_hive_config().get("llm", {})
+    if "max_context_tokens" in llm:
+        return llm["max_context_tokens"]
+    catalog = _catalog_limits_for(llm)
+    if catalog is not None:
+        return catalog[1]
+    return DEFAULT_MAX_CONTEXT_TOKENS
 
 
 def get_api_keys() -> list[str] | None:
