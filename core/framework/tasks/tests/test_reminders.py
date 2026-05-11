@@ -2,8 +2,7 @@
 
 The reminder state is a small counter machine; the policy is:
   - Bump on each iteration
-  - Reset to zero on any task op tool call (task_create / task_update /
-    colony_template_*)
+  - Reset to zero on any task op tool call (task_create / task_update)
   - When ``turns_since_task_op >= REMINDER_THRESHOLD_TURNS`` AND
     ``turns_since_last_reminder >= REMINDER_COOLDOWN_TURNS`` AND there
     are open tasks, fire a reminder
@@ -78,7 +77,6 @@ def test_cooldown_blocks_back_to_back() -> None:
 def test_saw_task_op_recognizes_mutating_tools() -> None:
     assert saw_task_op(["task_create"])
     assert saw_task_op(["read_file", "task_update"])
-    assert saw_task_op(["colony_template_add"])
     # Reads do NOT reset the counter — important: model could read forever
     # without making progress.
     assert not saw_task_op(["task_list", "task_get"])

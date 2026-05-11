@@ -33,9 +33,6 @@ TASK_OP_TOOL_NAMES: frozenset[str] = frozenset(
     {
         "task_create",
         "task_update",
-        "colony_template_add",
-        "colony_template_update",
-        "colony_template_remove",
     }
 )
 

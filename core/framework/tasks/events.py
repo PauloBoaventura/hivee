@@ -1,9 +1,8 @@
 """Bridge from the task store to the EventBus.
 
 The store is intentionally event-free — it's pure storage. The tool
-executors (and run_parallel_workers, and any future colony_template_*
-caller) are responsible for emitting the lifecycle events to the bus
-after successful mutations.
+executors (and run_parallel_workers) are responsible for emitting the
+lifecycle events to the bus after successful mutations.
 
 Events are scoped to a stream_id pulled from the execution context if
 available; otherwise they fan out at the global ``primary`` stream so the

@@ -6,9 +6,9 @@ Under the corrected model (see plan §5):
   - The colony has a separate template list:  ``colony:{colony_id}``
 
 ``resolve_task_list_id(ctx)`` returns the agent's OWN session list id —
-what the four task tools write to. The colony template is addressed via
-the dedicated ``colony_template_*`` tools and the UI; never via the four
-session tools.
+what the four task tools write to. The colony template is written by
+``run_parallel_workers`` directly and surfaced via the UI; never via the
+four session tools.
 """
 
 from __future__ import annotations

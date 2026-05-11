@@ -21,7 +21,7 @@ artifacts into ``tasks.json`` and unlinks them.
 All filesystem I/O is wrapped in ``asyncio.to_thread`` so the event loop
 never blocks. Locks use a ~3s budget — comfortable headroom for the only
 realistic write contender (colony template under concurrent
-``colony_template_*`` and ``run_parallel_workers`` stamps).
+``run_parallel_workers`` stamps).
 """
 
 from __future__ import annotations

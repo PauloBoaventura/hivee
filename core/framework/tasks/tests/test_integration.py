@@ -1,7 +1,7 @@
 """Integration tests that wire multiple subsystems together.
 
 Verifies the plan-and-spawn pattern end-to-end:
-  - Queen authors colony template entries (via colony_template_add)
+  - Colony template entries get authored (as run_parallel_workers does)
   - "spawn" stamps assigned_session metadata + emits the right event
   - Workers operate on their own session list (no fall-through)
 """
@@ -9,7 +9,6 @@ Verifies the plan-and-spawn pattern end-to-end:
 from __future__ import annotations
 
 import asyncio
-import json
 from pathlib import Path
 
 import pytest
@@ -27,7 +26,7 @@ from framework.tasks.scoping import (
     colony_task_list_id,
     session_task_list_id,
 )
-from framework.tasks.tools import register_colony_template_tools, register_task_tools
+from framework.tasks.tools import register_task_tools
 
 
 @pytest.fixture(autouse=True)
@@ -47,9 +46,10 @@ async def _invoke(reg: ToolRegistry, name: str, **inputs):
 
 @pytest.mark.asyncio
 async def test_queen_plans_workers_pick_up(tmp_path: Path) -> None:
-    """Queen authors a 3-step plan; we simulate spawning 3 workers, each
-    associated with one template entry. Each worker writes to its own
-    session list. The colony template gets stamped with assigned_session.
+    """run_parallel_workers authors a 3-step plan on the colony template;
+    we simulate spawning 3 workers, each associated with one template
+    entry. Each worker writes to its own session list. The colony
+    template gets stamped with assigned_session.
     """
     bus = EventBus()
     set_default_event_bus(bus)
@@ -68,30 +68,15 @@ async def test_queen_plans_workers_pick_up(tmp_path: Path) -> None:
     )
 
     store = TaskStore(hive_root=tmp_path)
-    queen_reg = ToolRegistry()
-    register_task_tools(queen_reg, store=store)
-    register_colony_template_tools(queen_reg, colony_id="alpha", store=store)
-
-    # 1. Queen authors the plan.
-    qtoken = ToolRegistry.set_execution_context(
-        agent_id="queen",
-        task_list_id=session_task_list_id("queen", "qsess"),
-        colony_id="alpha",
-    )
-    try:
-        for subject in ("crawl A", "crawl B", "crawl C"):
-            r = await _invoke(queen_reg, "colony_template_add", subject=subject)
-            assert json.loads(r.content)["success"] is True
-
-        # Verify the colony template now has 3 entries.
-        list_result = await _invoke(queen_reg, "colony_template_list")
-        body = json.loads(list_result.content)
-        assert body["count"] == 3
-        template_entries = body["tasks"]
-    finally:
-        ToolRegistry.reset_execution_context(qtoken)
-
     template_list_id = colony_task_list_id("alpha")
+    await store.ensure_task_list(template_list_id, role=TaskListRole.TEMPLATE)
+
+    # 1. Author the plan (mirrors run_parallel_workers' direct store writes).
+    template_entries = []
+    for subject in ("crawl A", "crawl B", "crawl C"):
+        rec = await store.create_task(template_list_id, subject=subject)
+        template_entries.append({"id": rec.id})
+    assert len(await store.list_tasks(template_list_id)) == 3
 
     # 2. Simulate spawning a worker per template entry: stamp the
     #    assigned_session and emit the assignment event.

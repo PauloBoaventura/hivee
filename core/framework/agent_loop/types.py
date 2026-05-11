@@ -186,8 +186,8 @@ class AgentContext:
     #   before the loop starts; immutable after first task_create.
     task_list_id: str | None = None
     # colony_id: set on the queen of a colony AND on every spawned worker
-    #   so workers can render the "picked up" chip and the queen can address
-    #   her colony template via colony_template_* tools.
+    #   so workers can render the "picked up" chip and run_parallel_workers
+    #   can address the queen's colony template list.
     colony_id: str | None = None
     # picked_up_from: for workers, the (colony_task_list_id, template_task_id)
     #   pair their session was spawned for. None for the queen and queen-DM.

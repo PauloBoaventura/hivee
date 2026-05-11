@@ -1,8 +1,8 @@
 """The four session task tools: task_create, task_update, task_list, task_get.
 
 All four operate on the calling agent's OWN session list. They never touch
-the colony template — the queen has separate ``colony_template_*`` tools
-for that (see ``colony_tools.py``).
+the colony template — that list is populated by ``run_parallel_workers``
+directly against the TaskStore.
 
 Concurrency safety:
     task_list, task_get      -> concurrency_safe=True (pure reads)

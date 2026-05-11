@@ -18,7 +18,7 @@ from framework.tasks.hooks import (
     clear_hooks,
     register_hook,
 )
-from framework.tasks.tools import register_colony_template_tools, register_task_tools
+from framework.tasks.tools import register_task_tools
 
 
 @pytest.fixture(autouse=True)
@@ -435,54 +435,5 @@ async def test_hook_blocks_task_completed_never_writes(
         assert after.updated_at == ts_before, (
             "veto-before-write violated: updated_at changed, indicating a transient write happened"
         )
-    finally:
-        ToolRegistry.reset_execution_context(token)
-
-
-# ---------------------------------------------------------------------------
-# Colony template tools
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def queen_registry(store: TaskStore) -> ToolRegistry:
-    reg = ToolRegistry()
-    register_task_tools(reg, store=store)
-    register_colony_template_tools(reg, colony_id="abc", store=store)
-    return reg
-
-
-@pytest.mark.asyncio
-async def test_colony_template_add_and_list(queen_registry: ToolRegistry) -> None:
-    reg = queen_registry
-    queen_session_list = "session:queen:sess_1"
-    token = _set_ctx(agent_id="queen", task_list_id=queen_session_list, colony_id="abc")
-    try:
-        await _invoke(reg, "colony_template_add", subject="crawl")
-        await _invoke(reg, "colony_template_add", subject="parse")
-        body = json.loads((await _invoke(reg, "colony_template_list")).content)
-        assert body["count"] == 2
-
-        # The session task list should be empty — colony tools don't write there.
-        body_session = json.loads((await _invoke(reg, "task_list")).content)
-        assert body_session["count"] == 0
-    finally:
-        ToolRegistry.reset_execution_context(token)
-
-
-@pytest.mark.asyncio
-async def test_colony_template_remove(queen_registry: ToolRegistry) -> None:
-    reg = queen_registry
-    token = _set_ctx(agent_id="queen", task_list_id="session:queen:sess_1", colony_id="abc")
-    try:
-        await _invoke(reg, "colony_template_add", subject="a")
-        await _invoke(reg, "colony_template_add", subject="b")
-        result = await _invoke(reg, "colony_template_remove", id=2)
-        body = json.loads(result.content)
-        assert body["success"] is True
-        # Next add gets id 3 (highwatermark preserved)
-        result2 = await _invoke(reg, "colony_template_add", subject="c")
-        body2 = json.loads(result2.content)
-        assert body2["task_id"] == 3
     finally:
         ToolRegistry.reset_execution_context(token)

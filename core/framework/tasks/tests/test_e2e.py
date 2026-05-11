@@ -25,7 +25,7 @@ from framework.loader.tool_registry import ToolRegistry
 from framework.tasks import TaskListRole, TaskStore
 from framework.tasks.events import set_default_event_bus
 from framework.tasks.hooks import clear_hooks
-from framework.tasks.tools import register_colony_template_tools, register_task_tools
+from framework.tasks.tools import register_task_tools
 
 
 @pytest.fixture(autouse=True)
@@ -44,7 +44,6 @@ def store(tmp_path: Path) -> TaskStore:
 def registry(store: TaskStore) -> ToolRegistry:
     reg = ToolRegistry()
     register_task_tools(reg, store=store)
-    register_colony_template_tools(reg, colony_id="abc", store=store)
     return reg
 
 

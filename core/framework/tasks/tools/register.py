@@ -1,8 +1,7 @@
 """Wire task tools into a ToolRegistry.
 
 The four session task tools are registered for every agent that gets a
-ToolRegistry. The colony template tools are queen-only and registered
-separately by ``register_colony_template_tools``.
+ToolRegistry.
 """
 
 from __future__ import annotations
@@ -53,22 +52,3 @@ def register_task_tools(
             # object itself (already done) and trust the dispatcher to read it.
             pass
     logger.debug("Registered task tools on %s", registry)
-
-
-def register_colony_template_tools(
-    registry: ToolRegistry,
-    *,
-    colony_id: str,
-    store: TaskStore | None = None,
-) -> None:
-    """Register the queen-only colony_template_* tools on ``registry``.
-
-    Should only be called for the queen of a colony — workers and queen-DM
-    do not get these tools.
-    """
-    from framework.tasks.tools.colony_tools import build_colony_template_tools
-
-    pairs = build_colony_template_tools(colony_id=colony_id, store=store)
-    for tool, async_executor in pairs:
-        registry.register(tool.name, tool, _wrap_async_executor(async_executor))
-    logger.debug("Registered colony_template_* tools (colony_id=%s)", colony_id)

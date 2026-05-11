@@ -7,9 +7,8 @@ See temp/tasks-system-implementation-plan.md for the design. Two list types:
 
 Each agent operates on its own session list via the session task tools
 (`task_create_batch`, `task_create`, `task_update`, `task_list`,
-`task_get`). The colony
-template is addressed only by the queen's `colony_template_*` tools and by
-the UI/event surface.
+`task_get`). The colony template is populated by `run_parallel_workers`
+and surfaced via the UI/event surface.
 """
 
 from framework.tasks.models import (

@@ -748,6 +748,12 @@ async def log_compaction(
     ratio_after = conversation.usage_ratio()
     before_pct = round(ratio_before * 100)
     after_pct = round(ratio_after * 100)
+    # Absolute token counts in K (1K = 1000). ratio_before is a fraction of
+    # max_context_tokens captured pre-compaction; multiply back to recover
+    # the absolute token count without re-estimating the pre-state.
+    max_ctx = conversation._max_context_tokens
+    before_k = round((ratio_before * max_ctx) / 1000) if max_ctx > 0 else 0
+    after_k = round(conversation.estimate_tokens() / 1000)
 
     # Determine label from what happened
     if after_pct >= before_pct - 1:
@@ -758,10 +764,12 @@ async def log_compaction(
         level = "structural"
 
     logger.info(
-        "Compaction complete (%s): %d%% -> %d%%",
+        "Compaction complete (%s): %d%% (%dK) -> %d%% (%dK)",
         level,
         before_pct,
+        before_k,
         after_pct,
+        after_k,
     )
 
     if ctx.runtime_logger:
@@ -769,9 +777,9 @@ async def log_compaction(
             node_id=ctx.agent_id,
             node_type="event_loop",
             step_index=-1,
-            llm_text=f"Context compacted ({level}): {before_pct}% \u2192 {after_pct}%",
+            llm_text=f"Context compacted ({level}): {before_pct}% ({before_k}K) \u2192 {after_pct}% ({after_k}K)",
             verdict="COMPACTION",
-            verdict_feedback=f"level={level} before={before_pct}% after={after_pct}%",
+            verdict_feedback=f"level={level} before={before_pct}%/{before_k}K after={after_pct}%/{after_k}K",
         )
 
     if event_bus:
@@ -781,6 +789,8 @@ async def log_compaction(
             "level": level,
             "usage_before": before_pct,
             "usage_after": after_pct,
+            "tokens_before_k": before_k,
+            "tokens_after_k": after_k,
         }
         if pre_inventory is not None:
             event_data["message_inventory"] = pre_inventory

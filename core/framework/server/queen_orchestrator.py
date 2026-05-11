@@ -486,19 +486,10 @@ async def create_queen(
     )
 
     # ---- Task system tools --------------------------------------------
-    # Every queen gets the four session task tools. Queens-of-colony
-    # additionally get the colony_template_* tools (gated by colony_id).
-    from framework.tasks.tools import (
-        register_colony_template_tools,
-        register_task_tools,
-    )
+    # Every queen gets the four session task tools.
+    from framework.tasks.tools import register_task_tools
 
     register_task_tools(queen_registry)
-    _colony_id_for_queen = getattr(session, "colony_id", None) or getattr(
-        getattr(session, "colony_runtime", None), "_colony_id", None
-    )
-    if _colony_id_for_queen:
-        register_colony_template_tools(queen_registry, colony_id=_colony_id_for_queen)
 
     # ---- Tracker tools ------------------------------------------------
     # The queen always gets all three (tracker_sql, tracker_register_writable,

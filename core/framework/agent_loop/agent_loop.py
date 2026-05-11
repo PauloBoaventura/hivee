@@ -4320,8 +4320,8 @@ class AgentLoop(AgentProtocol):
 
         ``logged_tool_calls`` is a list of dicts with at least a "name"
         key, as accumulated by ``_run_single_turn``. Names like
-        ``task_create``, ``task_update``, ``colony_template_*`` reset
-        the counter (see ``framework.tasks.reminders.TASK_OP_TOOL_NAMES``).
+        ``task_create`` and ``task_update`` reset the counter (see
+        ``framework.tasks.reminders.TASK_OP_TOOL_NAMES``).
         """
         from framework.tasks import get_task_store
         from framework.tasks.models import TaskStatus
