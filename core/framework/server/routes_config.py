@@ -24,6 +24,7 @@ from framework.config import (
     HIVE_CONFIG_FILE,
     OPENROUTER_API_BASE,
     get_hive_config,
+    get_token_settings,
 )
 from framework.llm.model_catalog import (
     find_model,
@@ -364,6 +365,39 @@ async def _validate_provider_key(
 # ------------------------------------------------------------------
 
 
+
+
+def _sanitize_token_settings(payload: dict) -> dict:
+    cfg = get_hive_config()
+    merged = dict(get_token_settings())
+    merged.update(payload or {})
+    cfg["token_settings"] = merged
+    # Re-read through getter to apply clamps consistently
+    return get_token_settings()
+
+
+async def handle_get_config(request: web.Request) -> web.Response:
+    return web.json_response({"token_settings": get_token_settings()})
+
+
+async def handle_patch_config(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON body"}, status=400)
+    ts = body.get("token_settings")
+    if not isinstance(ts, dict):
+        return web.json_response({"error": "token_settings object is required"}, status=400)
+    config = get_hive_config()
+    existing = config.get("token_settings", {})
+    existing.update(ts)
+    config["token_settings"] = existing
+    _write_config_atomic(config)
+    final = get_token_settings()
+    config = get_hive_config()
+    config["token_settings"] = final
+    _write_config_atomic(config)
+    return web.json_response({"token_settings": final})
 async def handle_get_llm_config(request: web.Request) -> web.Response:
     """GET /api/config/llm — current active LLM configuration."""
     config = get_hive_config()
@@ -397,6 +431,7 @@ async def handle_get_llm_config(request: web.Request) -> web.Response:
             "active_subscription": active_subscription,
             "detected_subscriptions": detected_subscriptions,
             "subscriptions": SUBSCRIPTIONS,
+            "token_settings": get_token_settings(),
         }
     )
 
@@ -755,6 +790,8 @@ async def handle_get_user_avatar(request: web.Request) -> web.Response:
 
 def register_routes(app: web.Application) -> None:
     """Register LLM config routes."""
+    app.router.add_get("/api/config", handle_get_config)
+    app.router.add_patch("/api/config", handle_patch_config)
     app.router.add_get("/api/config/llm", handle_get_llm_config)
     app.router.add_put("/api/config/llm", handle_update_llm_config)
     app.router.add_get("/api/config/models", handle_get_models)

@@ -4,7 +4,7 @@ import { useColony } from "@/context/ColonyContext";
 import { useTheme } from "@/context/ThemeContext";
 import { useModel, LLM_PROVIDERS } from "@/context/ModelContext";
 import { credentialsApi } from "@/api/credentials";
-import { configApi, type ModelOption } from "@/api/config";
+import { configApi, type ModelOption, type TokenSettings } from "@/api/config";
 import { compressImage } from "@/lib/image-utils";
 import McpServersPanel from "./McpServersPanel";
 
@@ -14,7 +14,7 @@ const TOKEN_PRESETS = [512, 768, 1024, 1536, 2048, 4096];
 interface SettingsModalProps {
   open: boolean;
   onClose: () => void;
-  initialSection?: "profile" | "byok" | "mcp";
+  initialSection?: "profile" | "byok" | "mcp" | "token";
 }
 
 function ValidationBadge({ state }: { state: "validating" | { valid: boolean | null; message: string } | undefined }) {
@@ -42,7 +42,7 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
 
   const [displayName, setDisplayName] = useState(userProfile.displayName);
   const [about, setAbout] = useState(userProfile.about);
-  const [activeSection, setActiveSection] = useState<"profile" | "byok" | "mcp">(initialSection || "profile");
+  const [activeSection, setActiveSection] = useState<"profile" | "byok" | "mcp" | "token">(initialSection || "profile");
   const [editingProvider, setEditingProvider] = useState<string | null>(null);
   const [keyInput, setKeyInput] = useState("");
   const [multiKeyInputs, setMultiKeyInputs] = useState<Record<string, string[]>>({
@@ -57,6 +57,14 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
   const [modelDropdownOpen, setModelDropdownOpen] = useState(false);
   const [themeDropdownOpen, setThemeDropdownOpen] = useState(false);
   const avatarUrl = `/api/config/profile/avatar?v=${userAvatarVersion}`;
+  const [tokenSettings, setTokenSettings] = useState<TokenSettings | null>(null);
+  const [tokenError, setTokenError] = useState("");
+
+  useEffect(() => {
+    if (!open) return;
+    void configApi.getAppConfig().then((resp) => setTokenSettings(resp.token_settings)).catch(() => setTokenError("Failed to load token settings"));
+  }, [open]);
+
   const [avatarFailed, setAvatarFailed] = useState(false);
   const [uploadingAvatar, setUploadingAvatar] = useState(false);
   const avatarInputRef = useRef<HTMLInputElement>(null);
@@ -360,6 +368,12 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
               BYOK
             </button>
             <button
+              onClick={() => setActiveSection("token")}
+              className={`text-left text-sm px-3 py-1.5 rounded-md ${activeSection === "token" ? "bg-primary/15 text-primary font-medium" : "text-muted-foreground hover:text-foreground hover:bg-muted/30"}`}
+            >
+              Token
+            </button>
+            <button
               onClick={() => setActiveSection("mcp")}
               className={`text-left text-sm px-3 py-1.5 rounded-md ${activeSection === "mcp" ? "bg-primary/15 text-primary font-medium" : "text-muted-foreground hover:text-foreground hover:bg-muted/30"}`}
             >
@@ -443,6 +457,24 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
                   <button onClick={handleSave} className="px-5 py-2 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90">Save</button>
                 </div>
               </>
+            )}
+
+
+            {activeSection === "token" && tokenSettings && (
+              <div className="rounded-lg border border-border/50 bg-muted/20 p-4 flex flex-col gap-3">
+                <h3 className="text-lg font-semibold text-foreground">Token Settings</h3>
+                {tokenError && <p className="text-xs text-red-400">{tokenError}</p>}
+                <label className="text-xs">Token budget total</label>
+                <input type="number" value={tokenSettings.token_budget_total} onChange={(e)=>setTokenSettings({...tokenSettings, token_budget_total:Number(e.target.value||0)})} className="w-full bg-muted/30 border border-border/50 rounded-lg px-3 py-2 text-sm" />
+                <label className="text-xs">Max output tokens</label>
+                <input type="number" value={tokenSettings.max_output_tokens} onChange={(e)=>setTokenSettings({...tokenSettings, max_output_tokens:Number(e.target.value||0)})} className="w-full bg-muted/30 border border-border/50 rounded-lg px-3 py-2 text-sm" />
+                <label className="text-xs">Reserved response tokens</label>
+                <input type="number" value={tokenSettings.reserved_response_tokens} onChange={(e)=>setTokenSettings({...tokenSettings, reserved_response_tokens:Number(e.target.value||0)})} className="w-full bg-muted/30 border border-border/50 rounded-lg px-3 py-2 text-sm" />
+                <p className="text-xs text-muted-foreground">Available input budget: {Math.max(0, tokenSettings.token_budget_total - tokenSettings.reserved_response_tokens)}</p>
+                {tokenSettings.token_budget_total < tokenSettings.max_output_tokens && <p className="text-xs text-amber-500">Max output tokens cannot exceed total token budget.</p>}
+                {tokenSettings.reserved_response_tokens >= tokenSettings.token_budget_total && <p className="text-xs text-amber-500">Reserved response tokens must be lower than total token budget.</p>}
+                <button type="button" onClick={async()=>{ try { const resp=await configApi.patchAppConfig(tokenSettings); setTokenSettings(resp.token_settings); setTokenError(""); } catch { setTokenError("Failed to save token settings"); } }} className="px-3 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-semibold">Save Token Settings</button>
+              </div>
             )}
 
             {activeSection === "mcp" && <McpServersPanel />}

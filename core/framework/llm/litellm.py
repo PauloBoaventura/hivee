@@ -249,7 +249,7 @@ def rewrite_proxy_model(
     return model, api_base, extra_headers
 
 
-RATE_LIMIT_MAX_RETRIES = 10
+RATE_LIMIT_MAX_RETRIES = 1
 RATE_LIMIT_BACKOFF_BASE = 2  # seconds
 RATE_LIMIT_MAX_DELAY = 120  # seconds - cap to prevent absurd waits
 # Separate, much lower cap for "empty response, finish_reason=stop"
@@ -936,6 +936,34 @@ def _extract_text_tool_calls(
     return events, cleaned
 
 
+
+
+def _apply_token_budget(messages: list[dict[str, Any]], system: str, tools: list[Tool] | None, requested_max_tokens: int) -> tuple[list[dict[str, Any]], int, dict[str, Any]]:
+    from framework.config import get_token_settings
+
+    ts = get_token_settings()
+    budget = int(ts["token_budget_total"])
+    max_output = min(int(requested_max_tokens), int(ts["max_output_tokens"]), budget)
+    estimated_input, _ = _estimate_tokens("", messages)
+    total = estimated_input + max_output
+    pruned = False
+    blocked = False
+    if total > budget and ts.get("auto_prune_context", True):
+        pruned = True
+        while len(messages) > 2 and total > budget:
+            messages = messages[1:]
+            estimated_input, _ = _estimate_tokens("", messages)
+            total = estimated_input + max_output
+    if total > budget and ts.get("auto_reduce_output_tokens", True):
+        max_output = max(1, budget - estimated_input)
+        total = estimated_input + max_output
+    if total > budget and ts.get("block_oversized_requests", True):
+        blocked = True
+        raise ValueError(f"Request blocked locally: token budget exceeded. estimated_input_tokens={estimated_input}, max_output_tokens={max_output}, token_budget_total={budget}.")
+    logger.info("[token-budget] estimated_input=%d output=%d total=%d budget=%d ok=%s final_max_tokens=%d pruned=%s blocked=%s", estimated_input, max_output, total, budget, total<=budget, max_output, pruned, blocked)
+    return messages, max_output, {"estimated_input_tokens": estimated_input, "token_budget_total": budget, "pruned": pruned}
+
+
 class LiteLLMProvider(LLMProvider):
     """
     LiteLLM-based LLM provider for multi-provider support.
@@ -1104,7 +1132,8 @@ class LiteLLMProvider(LLMProvider):
         needed between attempts.
         """
         model = kwargs.get("model", self.model)
-        retries = max_retries if max_retries is not None else RATE_LIMIT_MAX_RETRIES
+        from framework.config import get_token_settings
+        retries = max_retries if max_retries is not None else int(get_token_settings()["rate_limit_max_retries"])
         if self._key_pool:
             retries = min(retries, self._key_pool.size + 1)
         for attempt in range(retries + 1):
@@ -1268,6 +1297,7 @@ class LiteLLMProvider(LLMProvider):
         if system:
             full_messages.append({"role": "system", "content": system})
         full_messages.extend(messages)
+        full_messages, max_tokens, _token_budget = _apply_token_budget(full_messages, system, tools, max_tokens)
 
         # Add JSON mode via prompt engineering (works across all providers)
         if json_mode:
@@ -1355,7 +1385,8 @@ class LiteLLMProvider(LLMProvider):
         When a :class:`KeyPool` is configured, rate-limited keys are rotated.
         """
         model = kwargs.get("model", self.model)
-        retries = max_retries if max_retries is not None else RATE_LIMIT_MAX_RETRIES
+        from framework.config import get_token_settings
+        retries = max_retries if max_retries is not None else int(get_token_settings()["rate_limit_max_retries"])
         if self._key_pool:
             retries = min(retries, self._key_pool.size + 1)
         for attempt in range(retries + 1):
@@ -1523,6 +1554,7 @@ class LiteLLMProvider(LLMProvider):
         if sys_msg is not None:
             full_messages.append(sys_msg)
         full_messages.extend(messages)
+        full_messages, max_tokens, _token_budget = _apply_token_budget(full_messages, system, tools, max_tokens)
 
         if json_mode:
             json_instruction = "\n\nPlease respond with a valid JSON object."
