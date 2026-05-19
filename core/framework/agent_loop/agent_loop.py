@@ -1053,7 +1053,7 @@ class AgentLoop(AgentProtocol):
                     deterministic_no_retry = isinstance(e, (TokenBudgetExceededError, ProviderRequestTooLargeError)) or any(
                         marker in str(e).lower() for marker in ("api_key_invalid", "authenticationerror")
                     )
-                    if deterministic_no_retry:
+                    if deterministic_no_retry and not (isinstance(e, TokenBudgetExceededError) and ctx.supports_direct_user_io):
                         logger.error("[%s] iter=%d: deterministic LLM error, no persistent retry: %s", node_id, iteration, str(e)[:200])
                         raise
                     if self._is_capacity_error(e) and self._config.capacity_retry_max_seconds > 0:
@@ -1144,10 +1144,14 @@ class AgentLoop(AgentProtocol):
                     # can retry or adjust the request.
                     if ctx.supports_direct_user_io:
                         if isinstance(e, TokenBudgetExceededError):
+                            budget_msg = str(e)
+                            _m_total = re.search(r"total=(\d+)", budget_msg)
+                            _m_budget = re.search(r"budget=(\d+)", budget_msg)
+                            req_total = _m_total.group(1) if _m_total else "unknown"
+                            req_budget = _m_budget.group(1) if _m_budget else "unknown"
                             error_msg = (
-                                "Token budget exceeded. Current request requires more tokens than the configured "
-                                "budget. Increase Settings > System > Token > Token budget total or reduce "
-                                "context/tools/history."
+                                f"Token budget exceeded. Request requires {req_total} tokens but budget is {req_budget}. "
+                                "Reduce tools/context or increase Settings > System > Token > Token budget total."
                             )
                         else:
                             error_msg = f"LLM call failed: {e}"

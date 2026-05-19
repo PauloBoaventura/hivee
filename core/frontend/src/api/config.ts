@@ -59,6 +59,9 @@ export interface TokenSettings {
   include_history_in_budget: boolean;
   include_system_prompt_in_budget: boolean;
   rate_limit_max_retries: number;
+  max_tools_per_request: number;
+  tool_schema_budget_tokens: number;
+  auto_trim_tools: boolean;
 }
 
 export interface AppConfigResponse {

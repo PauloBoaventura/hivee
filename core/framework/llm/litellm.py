@@ -1629,12 +1629,29 @@ class LiteLLMProvider(LLMProvider):
         safety_margin = int(ts.get("safety_margin_tokens", 0) or 0)
         effective_budget = max(1, configured_budget - safety_margin)
         messages = list(kwargs.get("messages") or [])
-        tools = kwargs.get("tools") or []
+        tools = list(kwargs.get("tools") or [])
         model = str(kwargs.get("model") or self.model)
         provider = model.split("/", 1)[0] if "/" in model else model
         max_output = min(int(kwargs.get("max_tokens", 1) or 1), int(ts["max_output_tokens"]), effective_budget)
         pruned = False
         blocked = False
+        if tools and ts.get("auto_trim_tools", True):
+            tools_before = len(tools)
+            tools_tokens_before = _estimate_tokens_conservative(json.dumps(tools, ensure_ascii=False, default=str), model=model)
+            max_tools = int(ts.get("max_tools_per_request", 8))
+            schema_budget = int(ts.get("tool_schema_budget_tokens", 600))
+            trimmed = tools[:max_tools]
+            while trimmed and _estimate_tokens_conservative(json.dumps(trimmed, ensure_ascii=False, default=str), model=model) > schema_budget:
+                trimmed = trimmed[:-1]
+            tools = trimmed
+            tools_tokens_after = _estimate_tokens_conservative(json.dumps(tools, ensure_ascii=False, default=str), model=model) if tools else 0
+            logger.info(
+                "[token-budget] tools_before=%d tools_after=%d tools_tokens_before=%d tools_tokens_after=%d",
+                tools_before,
+                len(tools),
+                tools_tokens_before,
+                tools_tokens_after,
+            )
 
         def _totals() -> tuple[int, int, int, int]:
             estimated_message_tokens = _estimate_tokens_conservative(messages, model=model)
@@ -1696,6 +1713,7 @@ class LiteLLMProvider(LLMProvider):
 
         logger.info("[token-budget] configured_budget=%d safety_margin=%d effective_budget=%d messages_tokens=%d tools_tokens=%d other_tokens=%d output=%d total=%d ok=%s final_max_tokens=%d pruned=%s blocked=%s", configured_budget, safety_margin, effective_budget, msg_tokens, tools_tokens, other_tokens, max_output, total, total <= effective_budget, max_output, pruned, blocked)
         kwargs["messages"] = messages
+        kwargs["tools"] = tools
         kwargs["max_tokens"] = max_output
         return kwargs
 
@@ -2939,7 +2957,10 @@ class LiteLLMProvider(LLMProvider):
                     model = event.model
             elif isinstance(event, StreamErrorEvent):
                 if not event.recoverable:
-                    raise RuntimeError(f"Stream error: {event.error}")
+                    err = str(event.error)
+                    if "Token budget exceeded" in err:
+                        raise TokenBudgetExceededError(err)
+                    raise RuntimeError(f"Stream error: {err}")
 
         return LLMResponse(
             content=content,
