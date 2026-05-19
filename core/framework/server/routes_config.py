@@ -294,18 +294,24 @@ def _get_subscription_token(sub_id: str) -> str | None:
 
 
 def _hot_swap_sessions(request: web.Request, full_model: str, api_key: str | None, api_base: str | None) -> int:
-    """Hot-swap the LLM on all running sessions. Returns count of swapped sessions.
-
-    Also refreshes the SessionManager's default model so that subsequent
-    one-shot LLM consumers (e.g. /messages/classify, new session bootstrap)
-    pick up the new provider/model instead of the stale startup override.
-    """
+    """Hot-swap the LLM on all running sessions and cancel active generation state."""
     from framework.server.session_manager import SessionManager
 
     manager: SessionManager = request.app["manager"]
     manager._model = full_model
     swapped = 0
     for session in manager.list_sessions():
+        node = getattr(session, "node", None)
+        if node and hasattr(node, "cancel_current_turn"):
+            try:
+                node.cancel_current_turn()
+            except Exception:
+                logger.debug("Failed to cancel active turn during hot-swap", exc_info=True)
+        if node and hasattr(node, "_generation_id"):
+            try:
+                node._generation_id = None
+            except Exception:
+                logger.debug("Failed to invalidate generation id during hot-swap", exc_info=True)
         llm_provider = getattr(session, "llm", None)
         if llm_provider and hasattr(llm_provider, "reconfigure"):
             llm_provider.reconfigure(full_model, api_key=api_key, api_base=api_base)
