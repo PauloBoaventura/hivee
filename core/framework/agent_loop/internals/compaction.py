@@ -208,11 +208,12 @@ async def compact(
     # Recompaction detection
     now = time.monotonic()
     last_time = _last_compact_times.get(conv_id)
-    if last_time is not None and (now - last_time) < 30:
+    if last_time is not None and (now - last_time) < 60:
         logger.warning(
             "Recompaction chain detected: only %.1fs since last compaction",
             now - last_time,
         )
+        return
 
     ratio_before = conversation.usage_ratio()
     phase_grad = getattr(ctx, "continuous_mode", False)
@@ -285,7 +286,7 @@ async def compact(
         return
 
     # --- Step 3: LLM summary compaction ---
-    if ctx.llm is not None and not _llm_compaction_skipped:
+    if ctx.llm is not None and not _llm_compaction_skipped and conversation.usage_ratio() >= 0.8:
         logger.info(
             "LLM summary compaction triggered (%.0f%% usage)",
             conversation.usage_ratio() * 100,
