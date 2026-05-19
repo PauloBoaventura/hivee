@@ -64,6 +64,9 @@ export const credentialsApi = {
   get: (credentialId: string) =>
     api.get<CredentialInfo>(`/credentials/${credentialId}`),
 
+  getKeys: (credentialId: string) =>
+    api.get<{ credential_id: string; keys: string[] }>(`/credentials/${credentialId}/keys`),
+
   save: (credentialId: string, keys: Record<string, string>) =>
     api.post<{ saved: string }>("/credentials", {
       credential_id: credentialId,
