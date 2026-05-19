@@ -14,6 +14,18 @@ from framework.server.app import validate_agent_path
 logger = logging.getLogger(__name__)
 
 _llm_key_providers_cache: dict | None = None
+MULTI_KEY_CREDENTIAL_IDS = {"groq", "gemini"}
+
+
+def _api_key_sort_key(name: str) -> int:
+    if name == "api_key":
+        return 1
+    if name.startswith("api_key_"):
+        try:
+            return int(name.removeprefix("api_key_"))
+        except ValueError:
+            return 999999
+    return 999999
 
 
 def _get_llm_key_providers() -> dict:
@@ -148,6 +160,37 @@ async def handle_get_credential(request: web.Request) -> web.Response:
     if cred is None:
         return web.json_response({"error": f"Credential '{credential_id}' not found"}, status=404)
     return web.json_response(_credential_to_dict(cred))
+
+
+async def handle_get_credential_keys(request: web.Request) -> web.Response:
+    """GET /api/credentials/{credential_id}/keys — read ordered multi-key values for allowed providers."""
+    credential_id = request.match_info["credential_id"]
+    if credential_id not in MULTI_KEY_CREDENTIAL_IDS:
+        return web.json_response(
+            {"error": f"Multiple key editing is not enabled for '{credential_id}'"},
+            status=403,
+        )
+
+    store = _get_store(request)
+    try:
+        cred = store.get_credential(credential_id, refresh_if_needed=False)
+    except CredentialDecryptionError:
+        return web.json_response(
+            {
+                "error": f"Credential '{credential_id}' could not be decrypted",
+                "credential_id": credential_id,
+                "recoverable": True,
+            },
+            status=409,
+        )
+
+    if cred is None:
+        return web.json_response({"credential_id": credential_id, "keys": []})
+
+    key_names = [name for name in cred.keys if name == "api_key" or name.startswith("api_key_")]
+    key_names.sort(key=_api_key_sort_key)
+    values = [value for name in key_names if (value := cred.get_key(name))]
+    return web.json_response({"credential_id": credential_id, "keys": values})
 
 
 async def handle_save_credential(request: web.Request) -> web.Response:
@@ -556,5 +599,6 @@ def register_routes(app: web.Application) -> None:
     app.router.add_post("/api/credentials/validate-key", handle_validate_key)
     app.router.add_get("/api/credentials", handle_list_credentials)
     app.router.add_post("/api/credentials", handle_save_credential)
+    app.router.add_get("/api/credentials/{credential_id}/keys", handle_get_credential_keys)
     app.router.add_get("/api/credentials/{credential_id}", handle_get_credential)
     app.router.add_delete("/api/credentials/{credential_id}", handle_delete_credential)

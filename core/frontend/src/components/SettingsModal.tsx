@@ -177,7 +177,8 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
   const handleSaveMultiKeys = async (providerId: string) => {
     const keys = (multiKeyInputs[providerId] ?? [""])
       .map((key) => key.trim())
-      .filter(Boolean);
+      .filter(Boolean)
+      .filter((key, index, list) => list.indexOf(key) === index);
     if (!keys.length) return;
 
     setSaving(true);
@@ -257,15 +258,23 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
     (p) => connectedProviders.has(p.id) && availableModels[p.id]?.length,
   );
 
-  const startEditing = (providerId: string) => {
+  const startEditing = async (providerId: string) => {
     setEditingProvider(providerId);
     setKeyInput("");
     setShowKey(false);
     if (isMultiKeyProvider(providerId)) {
-      setMultiKeyInputs((prev) => ({
-        ...prev,
-        [providerId]: prev[providerId]?.length ? prev[providerId] : [""],
-      }));
+      setSaving(true);
+      try {
+        const resp = await credentialsApi.getKeys(providerId);
+        setMultiKeyInputs((prev) => ({
+          ...prev,
+          [providerId]: resp.keys.length ? resp.keys : [""],
+        }));
+      } catch {
+        setMultiKeyInputs((prev) => ({ ...prev, [providerId]: [""] }));
+      } finally {
+        setSaving(false);
+      }
     }
   };
 
@@ -491,12 +500,12 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
                             {isConnected && !isEditing ? (
                               <div className="flex items-center gap-2">
                                 <ValidationBadge state={validation[provider.id]} />
-                                <button onClick={() => startEditing(provider.id)} className="p-1 rounded text-muted-foreground/40 hover:text-foreground" title="Change key">
+                                <button onClick={() => void startEditing(provider.id)} className="p-1 rounded text-muted-foreground/40 hover:text-foreground" title="Change key">
                                   <Pencil className="w-3.5 h-3.5" />
                                 </button>
                               </div>
                             ) : !isEditing ? (
-                              <button onClick={() => startEditing(provider.id)}
+                              <button onClick={() => void startEditing(provider.id)}
                                 className="px-3 py-1.5 rounded-md text-xs font-semibold bg-primary text-primary-foreground hover:bg-primary/90">
                                 Add Key
                               </button>
