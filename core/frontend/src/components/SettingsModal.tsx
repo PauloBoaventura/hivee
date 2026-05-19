@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { X, Eye, EyeOff, Check, Pencil, ChevronDown, Zap, ThumbsUp, Loader2, AlertCircle, Camera } from "lucide-react";
+import { X, Eye, EyeOff, Check, Pencil, ChevronDown, Zap, ThumbsUp, Loader2, AlertCircle, Camera, Plus, Trash2 } from "lucide-react";
 import { useColony } from "@/context/ColonyContext";
 import { useTheme } from "@/context/ThemeContext";
 import { useModel, LLM_PROVIDERS } from "@/context/ModelContext";
@@ -7,6 +7,8 @@ import { credentialsApi } from "@/api/credentials";
 import { configApi, type ModelOption } from "@/api/config";
 import { compressImage } from "@/lib/image-utils";
 import McpServersPanel from "./McpServersPanel";
+
+const MULTI_KEY_PROVIDERS = new Set(["groq", "gemini"]);
 
 interface SettingsModalProps {
   open: boolean;
@@ -33,7 +35,7 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
   const {
     currentProvider, currentModel, connectedProviders, availableModels,
     setModel, saveProviderKey, subscriptions, detectedSubscriptions,
-    activeSubscription, activateSubscription,
+    activeSubscription, activateSubscription, refresh,
   } = useModel();
 
   const [displayName, setDisplayName] = useState(userProfile.displayName);
@@ -41,6 +43,10 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
   const [activeSection, setActiveSection] = useState<"profile" | "byok" | "mcp">(initialSection || "profile");
   const [editingProvider, setEditingProvider] = useState<string | null>(null);
   const [keyInput, setKeyInput] = useState("");
+  const [multiKeyInputs, setMultiKeyInputs] = useState<Record<string, string[]>>({
+    groq: [""],
+    gemini: [""],
+  });
   const [showKey, setShowKey] = useState(false);
   const [saving, setSaving] = useState(false);
   const [validation, setValidation] = useState<Record<string, "validating" | { valid: boolean | null; message: string }>>({});
@@ -95,6 +101,41 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
     setTimeout(() => setValidation((v) => { const next = { ...v }; delete next[providerId]; return next; }), 4000);
   };
 
+  const isMultiKeyProvider = (providerId: string) =>
+    MULTI_KEY_PROVIDERS.has(providerId);
+
+  const getProviderKeyInputs = (providerId: string) =>
+    multiKeyInputs[providerId] ?? [""];
+
+  const updateProviderKeyInput = (
+    providerId: string,
+    index: number,
+    value: string,
+  ) => {
+    setMultiKeyInputs((prev) => {
+      const current = prev[providerId] ?? [""];
+      const next = [...current];
+      next[index] = value;
+      return { ...prev, [providerId]: next };
+    });
+  };
+
+  const addProviderKeyInput = (providerId: string) => {
+    setMultiKeyInputs((prev) => {
+      const current = prev[providerId] ?? [""];
+      return { ...prev, [providerId]: [...current, ""] };
+    });
+  };
+
+  const removeProviderKeyInput = (providerId: string, index: number) => {
+    setMultiKeyInputs((prev) => {
+      const current = prev[providerId] ?? [""];
+      if (current.length <= 1) return prev;
+      const next = current.filter((_, i) => i !== index);
+      return { ...prev, [providerId]: next.length ? next : [""] };
+    });
+  };
+
   const handleSaveKey = async (providerId: string) => {
     const trimmedKey = keyInput.trim();
     if (!trimmedKey) return;
@@ -133,6 +174,70 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
     try { await setModel(provider, modelId); setModelDropdownOpen(false); } catch {}
   };
 
+  const handleSaveMultiKeys = async (providerId: string) => {
+    const keys = (multiKeyInputs[providerId] ?? [""])
+      .map((key) => key.trim())
+      .filter(Boolean);
+    if (!keys.length) return;
+
+    setSaving(true);
+    setValidation((v) => ({ ...v, [providerId]: "validating" }));
+
+    const primaryValidation = await credentialsApi
+      .validateKey(providerId, keys[0])
+      .catch(() => ({
+        valid: null as boolean | null,
+        message: "Could not verify key",
+      }));
+
+    if (primaryValidation.valid === false) {
+      setSaving(false);
+      setValidation((v) => ({
+        ...v,
+        [providerId]: {
+          valid: false,
+          message: primaryValidation.message,
+        },
+      }));
+      clearValidation(providerId);
+      return;
+    }
+
+    const payload = Object.fromEntries(
+      keys.map((key, index) => [
+        index === 0 ? "api_key" : `api_key_${index + 1}`,
+        key,
+      ]),
+    );
+
+    try {
+      await credentialsApi.save(providerId, payload);
+      setEditingProvider(null);
+      setMultiKeyInputs((prev) => ({ ...prev, [providerId]: [""] }));
+      setShowKey(false);
+      setValidation((v) => ({
+        ...v,
+        [providerId]: {
+          valid: primaryValidation.valid,
+          message: primaryValidation.message,
+        },
+      }));
+      await refresh();
+      clearValidation(providerId);
+    } catch {
+      setValidation((v) => ({
+        ...v,
+        [providerId]: {
+          valid: false,
+          message: "Failed to save keys",
+        },
+      }));
+      clearValidation(providerId);
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const handleActivateSubscription = async (subId: string) => {
     try { await activateSubscription(subId); } catch {}
   };
@@ -156,6 +261,12 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
     setEditingProvider(providerId);
     setKeyInput("");
     setShowKey(false);
+    if (isMultiKeyProvider(providerId)) {
+      setMultiKeyInputs((prev) => ({
+        ...prev,
+        [providerId]: prev[providerId]?.length ? prev[providerId] : [""],
+      }));
+    }
   };
 
   const cancelEditing = () => {
@@ -393,25 +504,92 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
                           </div>
                           {isEditing && (
                             <div className="ml-12 mr-2 mb-2 flex flex-col gap-1.5">
-                              <div className="flex items-center gap-2">
-                                <div className="relative flex-1">
-                                  <input
-                                    type={showKey ? "text" : "password"} value={keyInput}
-                                    onChange={(e) => setKeyInput(e.target.value)}
-                                    placeholder={`Enter ${provider.name} API key`} autoFocus
-                                    onKeyDown={(e) => { if (e.key === "Enter") handleSaveKey(provider.id); if (e.key === "Escape") cancelEditing(); }}
-                                    className="w-full bg-muted/30 border border-border/50 rounded-lg px-3 py-2 pr-9 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary/40 font-mono"
-                                  />
-                                  <button onClick={() => setShowKey(!showKey)} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground/50 hover:text-foreground">
-                                    {showKey ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                              {isMultiKeyProvider(provider.id) ? (
+                                <>
+                                  <div className="flex flex-col gap-2">
+                                    {getProviderKeyInputs(provider.id).map((value, index) => (
+                                      <div key={index} className="flex items-center gap-2">
+                                        <div className="relative flex-1">
+                                          <input
+                                            type={showKey ? "text" : "password"}
+                                            value={value}
+                                            onChange={(e) =>
+                                              updateProviderKeyInput(provider.id, index, e.target.value)
+                                            }
+                                            placeholder={`${provider.name} API key ${index + 1}`}
+                                            autoFocus={index === 0}
+                                            onKeyDown={(e) => {
+                                              if (e.key === "Enter") handleSaveMultiKeys(provider.id);
+                                              if (e.key === "Escape") cancelEditing();
+                                            }}
+                                            className="w-full bg-muted/30 border border-border/50 rounded-lg px-3 py-2 pr-9 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary/40 font-mono"
+                                          />
+                                          <button onClick={() => setShowKey(!showKey)} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground/50 hover:text-foreground" type="button">
+                                            {showKey ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                                          </button>
+                                        </div>
+                                        {getProviderKeyInputs(provider.id).length > 1 && (
+                                          <button
+                                            onClick={() => removeProviderKeyInput(provider.id, index)}
+                                            className="p-2 rounded-lg text-muted-foreground hover:text-red-400 hover:bg-muted/30"
+                                            title="Remove key"
+                                            type="button"
+                                          >
+                                            <Trash2 className="w-3.5 h-3.5" />
+                                          </button>
+                                        )}
+                                      </div>
+                                    ))}
+                                  </div>
+
+                                  <div className="flex items-center gap-2">
+                                    <button
+                                      onClick={() => addProviderKeyInput(provider.id)}
+                                      className="inline-flex items-center gap-1 px-3 py-1.5 rounded-md text-xs font-semibold bg-primary/10 text-primary border border-primary/20 hover:bg-primary/20"
+                                      type="button"
+                                    >
+                                      <Plus className="w-3.5 h-3.5" />
+                                      Add another key
+                                    </button>
+
+                                    <button
+                                      onClick={() => handleSaveMultiKeys(provider.id)}
+                                      disabled={
+                                        saving ||
+                                        !getProviderKeyInputs(provider.id).some((key) => key.trim())
+                                      }
+                                      className="px-3 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-semibold hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed"
+                                      type="button"
+                                    >
+                                      {saving ? "..." : "Save keys"}
+                                    </button>
+                                    <button onClick={cancelEditing} className="px-3 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/30" type="button">Cancel</button>
+                                  </div>
+                                  <p className="text-[11px] text-muted-foreground">
+                                    Multiple keys are used as a provider key pool. On 429/rate limit, Hive rotates to the next saved key automatically.
+                                  </p>
+                                </>
+                              ) : (
+                                <div className="flex items-center gap-2">
+                                  <div className="relative flex-1">
+                                    <input
+                                      type={showKey ? "text" : "password"} value={keyInput}
+                                      onChange={(e) => setKeyInput(e.target.value)}
+                                      placeholder={`Enter ${provider.name} API key`} autoFocus
+                                      onKeyDown={(e) => { if (e.key === "Enter") handleSaveKey(provider.id); if (e.key === "Escape") cancelEditing(); }}
+                                      className="w-full bg-muted/30 border border-border/50 rounded-lg px-3 py-2 pr-9 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary/40 font-mono"
+                                    />
+                                    <button onClick={() => setShowKey(!showKey)} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground/50 hover:text-foreground" type="button">
+                                      {showKey ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                                    </button>
+                                  </div>
+                                  <button onClick={() => handleSaveKey(provider.id)} disabled={!keyInput.trim() || saving}
+                                    className="px-3 py-2 rounded-lg bg-primary text-primary-foreground text-xs font-semibold hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed">
+                                    {saving ? "..." : "Save"}
                                   </button>
+                                  <button onClick={cancelEditing} className="px-3 py-2 rounded-lg text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/30">Cancel</button>
                                 </div>
-                                <button onClick={() => handleSaveKey(provider.id)} disabled={!keyInput.trim() || saving}
-                                  className="px-3 py-2 rounded-lg bg-primary text-primary-foreground text-xs font-semibold hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed">
-                                  {saving ? "..." : "Save"}
-                                </button>
-                                <button onClick={cancelEditing} className="px-3 py-2 rounded-lg text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/30">Cancel</button>
-                              </div>
+                              )}
                               {validation[provider.id] === "validating" && (
                                 <StatusText icon={<Loader2 className="w-3 h-3 animate-spin" />} color="muted">Verifying...</StatusText>
                               )}
