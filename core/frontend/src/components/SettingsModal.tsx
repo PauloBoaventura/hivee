@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { X, Eye, EyeOff, Check, Pencil, ChevronDown, Zap, ThumbsUp, Loader2, AlertCircle, Camera } from "lucide-react";
+import { X, Eye, EyeOff, Check, Pencil, ChevronDown, Zap, ThumbsUp, Loader2, AlertCircle, Camera, Plus, Trash2 } from "lucide-react";
 import { useColony } from "@/context/ColonyContext";
 import { useTheme } from "@/context/ThemeContext";
 import { useModel, LLM_PROVIDERS } from "@/context/ModelContext";
@@ -7,6 +7,9 @@ import { credentialsApi } from "@/api/credentials";
 import { configApi, type ModelOption } from "@/api/config";
 import { compressImage } from "@/lib/image-utils";
 import McpServersPanel from "./McpServersPanel";
+
+const MULTI_KEY_PROVIDERS = new Set(["groq", "gemini"]);
+const TOKEN_PRESETS = [512, 768, 1024, 1536, 2048, 4096];
 
 interface SettingsModalProps {
   open: boolean;
@@ -32,8 +35,9 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
   const { theme, setTheme } = useTheme();
   const {
     currentProvider, currentModel, connectedProviders, availableModels,
+    currentMaxTokens, currentMaxContextTokens,
     setModel, saveProviderKey, subscriptions, detectedSubscriptions,
-    activeSubscription, activateSubscription,
+    activeSubscription, activateSubscription, refresh,
   } = useModel();
 
   const [displayName, setDisplayName] = useState(userProfile.displayName);
@@ -41,6 +45,12 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
   const [activeSection, setActiveSection] = useState<"profile" | "byok" | "mcp">(initialSection || "profile");
   const [editingProvider, setEditingProvider] = useState<string | null>(null);
   const [keyInput, setKeyInput] = useState("");
+  const [multiKeyInputs, setMultiKeyInputs] = useState<Record<string, string[]>>({
+    groq: [""],
+    gemini: [""],
+  });
+  const [customMaxTokens, setCustomMaxTokens] = useState<number>(1024);
+  const [customMaxContextTokens, setCustomMaxContextTokens] = useState<number>(24000);
   const [showKey, setShowKey] = useState(false);
   const [saving, setSaving] = useState(false);
   const [validation, setValidation] = useState<Record<string, "validating" | { valid: boolean | null; message: string }>>({});
@@ -70,6 +80,16 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
     }
   }, [open, userProfile, initialSection]);
 
+  useEffect(() => {
+    if (!open) return;
+    if (typeof currentMaxTokens === "number" && currentMaxTokens > 0) {
+      setCustomMaxTokens(currentMaxTokens);
+    }
+    if (typeof currentMaxContextTokens === "number" && currentMaxContextTokens > 0) {
+      setCustomMaxContextTokens(currentMaxContextTokens);
+    }
+  }, [open, currentMaxTokens, currentMaxContextTokens]);
+
   if (!open) return null;
 
   const handleSave = () => {
@@ -93,6 +113,41 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
 
   const clearValidation = (providerId: string) => {
     setTimeout(() => setValidation((v) => { const next = { ...v }; delete next[providerId]; return next; }), 4000);
+  };
+
+  const isMultiKeyProvider = (providerId: string) =>
+    MULTI_KEY_PROVIDERS.has(providerId);
+
+  const getProviderKeyInputs = (providerId: string) =>
+    multiKeyInputs[providerId] ?? [""];
+
+  const updateProviderKeyInput = (
+    providerId: string,
+    index: number,
+    value: string,
+  ) => {
+    setMultiKeyInputs((prev) => {
+      const current = prev[providerId] ?? [""];
+      const next = [...current];
+      next[index] = value;
+      return { ...prev, [providerId]: next };
+    });
+  };
+
+  const addProviderKeyInput = (providerId: string) => {
+    setMultiKeyInputs((prev) => {
+      const current = prev[providerId] ?? [""];
+      return { ...prev, [providerId]: [...current, ""] };
+    });
+  };
+
+  const removeProviderKeyInput = (providerId: string, index: number) => {
+    setMultiKeyInputs((prev) => {
+      const current = prev[providerId] ?? [""];
+      if (current.length <= 1) return prev;
+      const next = current.filter((_, i) => i !== index);
+      return { ...prev, [providerId]: next.length ? next : [""] };
+    });
   };
 
   const handleSaveKey = async (providerId: string) => {
@@ -130,17 +185,102 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
   };
 
   const handleSelectModel = async (provider: string, modelId: string) => {
-    try { await setModel(provider, modelId); setModelDropdownOpen(false); } catch {}
+    const modelInfo = (availableModels[provider] || []).find((m) => m.id === modelId);
+    const maxModelTokens = modelInfo?.max_tokens ?? selectedModelMaxTokens;
+    const maxModelContextTokens = modelInfo?.max_context_tokens ?? selectedModelMaxContextTokens;
+    const nextMaxTokens = clampNumber(customMaxTokens, 256, maxModelTokens);
+    const nextMaxContextTokens = clampNumber(customMaxContextTokens, 4096, maxModelContextTokens);
+    try {
+      await setModel(provider, modelId, {
+        max_tokens: nextMaxTokens,
+        max_context_tokens: nextMaxContextTokens,
+      });
+      setCustomMaxTokens(nextMaxTokens);
+      setCustomMaxContextTokens(nextMaxContextTokens);
+      setModelDropdownOpen(false);
+    } catch {}
+  };
+
+  const handleSaveMultiKeys = async (providerId: string) => {
+    const keys = (multiKeyInputs[providerId] ?? [""])
+      .map((key) => key.trim())
+      .filter(Boolean)
+      .filter((key, index, list) => list.indexOf(key) === index);
+    if (!keys.length) return;
+
+    setSaving(true);
+    setValidation((v) => ({ ...v, [providerId]: "validating" }));
+
+    const primaryValidation = await credentialsApi
+      .validateKey(providerId, keys[0])
+      .catch(() => ({
+        valid: null as boolean | null,
+        message: "Could not verify key",
+      }));
+
+    if (primaryValidation.valid === false) {
+      setSaving(false);
+      setValidation((v) => ({
+        ...v,
+        [providerId]: {
+          valid: false,
+          message: primaryValidation.message,
+        },
+      }));
+      clearValidation(providerId);
+      return;
+    }
+
+    const payload = Object.fromEntries(
+      keys.map((key, index) => [
+        index === 0 ? "api_key" : `api_key_${index + 1}`,
+        key,
+      ]),
+    );
+
+    try {
+      await credentialsApi.save(providerId, payload);
+      setEditingProvider(null);
+      setMultiKeyInputs((prev) => ({ ...prev, [providerId]: [""] }));
+      setShowKey(false);
+      setValidation((v) => ({
+        ...v,
+        [providerId]: {
+          valid: primaryValidation.valid,
+          message: primaryValidation.message,
+        },
+      }));
+      await refresh();
+      clearValidation(providerId);
+    } catch {
+      setValidation((v) => ({
+        ...v,
+        [providerId]: {
+          valid: false,
+          message: "Failed to save keys",
+        },
+      }));
+      clearValidation(providerId);
+    } finally {
+      setSaving(false);
+    }
   };
 
   const handleActivateSubscription = async (subId: string) => {
     try { await activateSubscription(subId); } catch {}
   };
 
+  const clampNumber = (value: number, min: number, max: number) =>
+    Math.min(Math.max(value, min), max);
+
   const initials = displayName.trim().split(/\s+/).map((w) => w[0]).join("").toUpperCase().slice(0, 2);
 
   const activeSubInfo = activeSubscription ? subscriptions.find((s) => s.id === activeSubscription) : null;
   const providerForModels = activeSubInfo?.provider || currentProvider;
+  const selectedModelInfo =
+    (availableModels[providerForModels] || []).find((m) => m.id === currentModel) || null;
+  const selectedModelMaxTokens = selectedModelInfo?.max_tokens ?? 4096;
+  const selectedModelMaxContextTokens = selectedModelInfo?.max_context_tokens ?? 32000;
   const modelsForLabel = availableModels[providerForModels] || [];
   const currentModelLabel = modelsForLabel.find((m) => m.id === currentModel)?.label || currentModel || "Not configured";
 
@@ -152,15 +292,46 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
     (p) => connectedProviders.has(p.id) && availableModels[p.id]?.length,
   );
 
-  const startEditing = (providerId: string) => {
+  const startEditing = async (providerId: string) => {
     setEditingProvider(providerId);
     setKeyInput("");
     setShowKey(false);
+    if (isMultiKeyProvider(providerId)) {
+      setSaving(true);
+      try {
+        const resp = await credentialsApi.getKeys(providerId);
+        setMultiKeyInputs((prev) => ({
+          ...prev,
+          [providerId]: resp.keys.length ? resp.keys : [""],
+        }));
+      } catch {
+        setMultiKeyInputs((prev) => ({ ...prev, [providerId]: [""] }));
+      } finally {
+        setSaving(false);
+      }
+    }
   };
 
   const cancelEditing = () => {
     setEditingProvider(null);
     setKeyInput("");
+  };
+
+  const handleSaveTokenLimits = async () => {
+    if (!currentProvider || !currentModel) return;
+    const nextMaxTokens = clampNumber(customMaxTokens, 256, selectedModelMaxTokens);
+    const nextMaxContextTokens = clampNumber(customMaxContextTokens, 4096, selectedModelMaxContextTokens);
+    setSaving(true);
+    try {
+      await setModel(currentProvider, currentModel, {
+        max_tokens: nextMaxTokens,
+        max_context_tokens: nextMaxContextTokens,
+      });
+      setCustomMaxTokens(nextMaxTokens);
+      setCustomMaxContextTokens(nextMaxContextTokens);
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -326,6 +497,72 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
                   </div>
                 </div>
 
+                {/* Token Limits */}
+                <div>
+                  <p className="text-[11px] font-semibold text-muted-foreground/60 uppercase tracking-wider mb-3">
+                    Token limits
+                  </p>
+                  <div className="rounded-lg border border-border/50 bg-muted/20 p-3 flex flex-col gap-3">
+                    <div>
+                      <label className="text-xs font-medium text-foreground mb-1.5 block">max_tokens</label>
+                      <div className="flex flex-wrap gap-1.5 mb-2">
+                        {TOKEN_PRESETS.map((preset) => {
+                          const disabled = preset > selectedModelMaxTokens;
+                          const active = customMaxTokens === preset;
+                          return (
+                            <button
+                              key={preset}
+                              type="button"
+                              disabled={disabled}
+                              onClick={() => setCustomMaxTokens(clampNumber(preset, 256, selectedModelMaxTokens))}
+                              className={`px-2.5 py-1 rounded-md text-xs font-medium border ${active ? "bg-primary/15 text-primary border-primary/30" : "bg-background/40 text-muted-foreground border-border/50 hover:text-foreground hover:bg-muted/30"} disabled:opacity-40 disabled:cursor-not-allowed`}
+                            >
+                              {preset}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <input
+                        type="number"
+                        min={256}
+                        max={selectedModelMaxTokens}
+                        value={customMaxTokens}
+                        onChange={(e) => setCustomMaxTokens(clampNumber(Number(e.target.value || 0), 256, selectedModelMaxTokens))}
+                        className="w-full bg-muted/30 border border-border/50 rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
+                      />
+                      <p className="text-[11px] text-muted-foreground mt-1">
+                        Model maximum: {selectedModelMaxTokens}. Lower values reduce output size and help avoid 429.
+                      </p>
+                    </div>
+
+                    <div>
+                      <label className="text-xs font-medium text-foreground mb-1.5 block">max_context_tokens</label>
+                      <input
+                        type="number"
+                        min={4096}
+                        max={selectedModelMaxContextTokens}
+                        value={customMaxContextTokens}
+                        onChange={(e) => setCustomMaxContextTokens(clampNumber(Number(e.target.value || 0), 4096, selectedModelMaxContextTokens))}
+                        className="w-full bg-muted/30 border border-border/50 rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
+                      />
+                      <p className="text-[11px] text-muted-foreground mt-1">
+                        Model context maximum: {selectedModelMaxContextTokens}. Lower values reduce large prompts and tool history.
+                      </p>
+                    </div>
+
+                    <div className="flex justify-end">
+                      <button
+                        type="button"
+                        onClick={handleSaveTokenLimits}
+                        disabled={saving || !currentProvider || !currentModel}
+                        className="px-3 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-semibold hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {saving ? "Saving..." : "Save token limits"}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
                 {/* Subscriptions */}
                 {subscriptions.length > 0 && (
                   <div>
@@ -380,12 +617,12 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
                             {isConnected && !isEditing ? (
                               <div className="flex items-center gap-2">
                                 <ValidationBadge state={validation[provider.id]} />
-                                <button onClick={() => startEditing(provider.id)} className="p-1 rounded text-muted-foreground/40 hover:text-foreground" title="Change key">
+                                <button onClick={() => void startEditing(provider.id)} className="p-1 rounded text-muted-foreground/40 hover:text-foreground" title="Change key">
                                   <Pencil className="w-3.5 h-3.5" />
                                 </button>
                               </div>
                             ) : !isEditing ? (
-                              <button onClick={() => startEditing(provider.id)}
+                              <button onClick={() => void startEditing(provider.id)}
                                 className="px-3 py-1.5 rounded-md text-xs font-semibold bg-primary text-primary-foreground hover:bg-primary/90">
                                 Add Key
                               </button>
@@ -393,25 +630,92 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
                           </div>
                           {isEditing && (
                             <div className="ml-12 mr-2 mb-2 flex flex-col gap-1.5">
-                              <div className="flex items-center gap-2">
-                                <div className="relative flex-1">
-                                  <input
-                                    type={showKey ? "text" : "password"} value={keyInput}
-                                    onChange={(e) => setKeyInput(e.target.value)}
-                                    placeholder={`Enter ${provider.name} API key`} autoFocus
-                                    onKeyDown={(e) => { if (e.key === "Enter") handleSaveKey(provider.id); if (e.key === "Escape") cancelEditing(); }}
-                                    className="w-full bg-muted/30 border border-border/50 rounded-lg px-3 py-2 pr-9 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary/40 font-mono"
-                                  />
-                                  <button onClick={() => setShowKey(!showKey)} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground/50 hover:text-foreground">
-                                    {showKey ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                              {isMultiKeyProvider(provider.id) ? (
+                                <>
+                                  <div className="flex flex-col gap-2">
+                                    {getProviderKeyInputs(provider.id).map((value, index) => (
+                                      <div key={index} className="flex items-center gap-2">
+                                        <div className="relative flex-1">
+                                          <input
+                                            type={showKey ? "text" : "password"}
+                                            value={value}
+                                            onChange={(e) =>
+                                              updateProviderKeyInput(provider.id, index, e.target.value)
+                                            }
+                                            placeholder={`${provider.name} API key ${index + 1}`}
+                                            autoFocus={index === 0}
+                                            onKeyDown={(e) => {
+                                              if (e.key === "Enter") handleSaveMultiKeys(provider.id);
+                                              if (e.key === "Escape") cancelEditing();
+                                            }}
+                                            className="w-full bg-muted/30 border border-border/50 rounded-lg px-3 py-2 pr-9 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary/40 font-mono"
+                                          />
+                                          <button onClick={() => setShowKey(!showKey)} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground/50 hover:text-foreground" type="button">
+                                            {showKey ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                                          </button>
+                                        </div>
+                                        {getProviderKeyInputs(provider.id).length > 1 && (
+                                          <button
+                                            onClick={() => removeProviderKeyInput(provider.id, index)}
+                                            className="p-2 rounded-lg text-muted-foreground hover:text-red-400 hover:bg-muted/30"
+                                            title="Remove key"
+                                            type="button"
+                                          >
+                                            <Trash2 className="w-3.5 h-3.5" />
+                                          </button>
+                                        )}
+                                      </div>
+                                    ))}
+                                  </div>
+
+                                  <div className="flex items-center gap-2">
+                                    <button
+                                      onClick={() => addProviderKeyInput(provider.id)}
+                                      className="inline-flex items-center gap-1 px-3 py-1.5 rounded-md text-xs font-semibold bg-primary/10 text-primary border border-primary/20 hover:bg-primary/20"
+                                      type="button"
+                                    >
+                                      <Plus className="w-3.5 h-3.5" />
+                                      Add another key
+                                    </button>
+
+                                    <button
+                                      onClick={() => handleSaveMultiKeys(provider.id)}
+                                      disabled={
+                                        saving ||
+                                        !getProviderKeyInputs(provider.id).some((key) => key.trim())
+                                      }
+                                      className="px-3 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-semibold hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed"
+                                      type="button"
+                                    >
+                                      {saving ? "..." : "Save keys"}
+                                    </button>
+                                    <button onClick={cancelEditing} className="px-3 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/30" type="button">Cancel</button>
+                                  </div>
+                                  <p className="text-[11px] text-muted-foreground">
+                                    Multiple keys are used as a provider key pool. On 429/rate limit, Hive rotates to the next saved key automatically.
+                                  </p>
+                                </>
+                              ) : (
+                                <div className="flex items-center gap-2">
+                                  <div className="relative flex-1">
+                                    <input
+                                      type={showKey ? "text" : "password"} value={keyInput}
+                                      onChange={(e) => setKeyInput(e.target.value)}
+                                      placeholder={`Enter ${provider.name} API key`} autoFocus
+                                      onKeyDown={(e) => { if (e.key === "Enter") handleSaveKey(provider.id); if (e.key === "Escape") cancelEditing(); }}
+                                      className="w-full bg-muted/30 border border-border/50 rounded-lg px-3 py-2 pr-9 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary/40 font-mono"
+                                    />
+                                    <button onClick={() => setShowKey(!showKey)} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground/50 hover:text-foreground" type="button">
+                                      {showKey ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                                    </button>
+                                  </div>
+                                  <button onClick={() => handleSaveKey(provider.id)} disabled={!keyInput.trim() || saving}
+                                    className="px-3 py-2 rounded-lg bg-primary text-primary-foreground text-xs font-semibold hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed">
+                                    {saving ? "..." : "Save"}
                                   </button>
+                                  <button onClick={cancelEditing} className="px-3 py-2 rounded-lg text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/30">Cancel</button>
                                 </div>
-                                <button onClick={() => handleSaveKey(provider.id)} disabled={!keyInput.trim() || saving}
-                                  className="px-3 py-2 rounded-lg bg-primary text-primary-foreground text-xs font-semibold hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed">
-                                  {saving ? "..." : "Save"}
-                                </button>
-                                <button onClick={cancelEditing} className="px-3 py-2 rounded-lg text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/30">Cancel</button>
-                              </div>
+                              )}
                               {validation[provider.id] === "validating" && (
                                 <StatusText icon={<Loader2 className="w-3 h-3 animate-spin" />} color="muted">Verifying...</StatusText>
                               )}
