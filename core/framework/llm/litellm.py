@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import math
 import hashlib
 import json
 import logging
@@ -959,9 +960,19 @@ def _apply_token_budget(messages: list[dict[str, Any]], system: str, tools: list
         total = estimated_input + max_output
     if total > budget and ts.get("block_oversized_requests", True):
         blocked = True
-        raise ValueError(f"Request blocked locally: token budget exceeded. estimated_input_tokens={estimated_input}, max_output_tokens={max_output}, token_budget_total={budget}.")
+        raise TokenBudgetExceededError(
+            f"Request blocked locally: token budget exceeded. estimated_input_tokens={estimated_input}, max_output_tokens={max_output}, token_budget_total={budget}."
+        )
     logger.info("[token-budget] estimated_input=%d output=%d total=%d budget=%d ok=%s final_max_tokens=%d pruned=%s blocked=%s", estimated_input, max_output, total, budget, total<=budget, max_output, pruned, blocked)
     return messages, max_output, {"estimated_input_tokens": estimated_input, "token_budget_total": budget, "pruned": pruned}
+
+
+def _is_provider_request_too_large_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(
+        marker in msg
+        for marker in ("request too large", "tokens per minute", "requested", "please reduce your message size")
+    )
 
 
 class LiteLLMProvider(LLMProvider):
@@ -1143,6 +1154,7 @@ class LiteLLMProvider(LLMProvider):
                 current_key = self._key_pool.get_key()
                 kwargs["api_key"] = current_key
             try:
+                kwargs = self._enforce_final_token_budget(kwargs)
                 response = litellm.completion(**kwargs)  # type: ignore[union-attr]
 
                 # Some providers (e.g. Gemini) return 200 with empty content on
@@ -1263,6 +1275,10 @@ class LiteLLMProvider(LLMProvider):
                     f"(attempt {attempt + 1}/{retries})"
                 )
                 time.sleep(wait)
+            except Exception as e:
+                if _is_provider_request_too_large_error(e):
+                    raise ProviderRequestTooLargeError(str(e)) from e
+                raise
         # unreachable, but satisfies type checker
         raise RuntimeError("Exhausted rate limit retries")
 
@@ -1396,6 +1412,7 @@ class LiteLLMProvider(LLMProvider):
                 current_key = self._key_pool.get_key()
                 kwargs["api_key"] = current_key
             try:
+                kwargs = self._enforce_final_token_budget(kwargs)
                 response = await litellm.acompletion(**kwargs)  # type: ignore[union-attr]
 
                 content = response.choices[0].message.content if response.choices else None
@@ -1511,6 +1528,10 @@ class LiteLLMProvider(LLMProvider):
                     f"(attempt {attempt + 1}/{retries})"
                 )
                 await asyncio.sleep(wait)
+            except Exception as e:
+                if _is_provider_request_too_large_error(e):
+                    raise ProviderRequestTooLargeError(str(e)) from e
+                raise
         raise RuntimeError("Exhausted rate limit retries")
 
     async def acomplete(
@@ -1622,6 +1643,62 @@ class LiteLLMProvider(LLMProvider):
                 },
             },
         }
+
+    def _enforce_final_token_budget(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        from framework.config import get_token_settings
+
+        ts = get_token_settings()
+        configured_budget = int(ts["token_budget_total"])
+        safety_margin = int(ts.get("safety_margin_tokens", 0) or 0)
+        effective_budget = max(1, configured_budget - safety_margin)
+        messages = list(kwargs.get("messages") or [])
+        tools = kwargs.get("tools") or []
+        max_output = min(int(kwargs.get("max_tokens", 1) or 1), int(ts["max_output_tokens"]), effective_budget)
+        pruned = False
+        blocked = False
+        while len(messages) > 2:
+            msg_tokens = _estimate_tokens_conservative(messages, model=self.model)
+            tools_tokens = _estimate_tokens_conservative(tools, model=self.model) if tools else 0
+            other_payload = {
+                "tool_choice": kwargs.get("tool_choice"),
+                "response_format": kwargs.get("response_format"),
+                "extra_body": kwargs.get("extra_body"),
+                "provider": self.model.split("/", 1)[0] if "/" in self.model else self.model,
+                "model": kwargs.get("model"),
+            }
+            other_tokens = _estimate_tokens_conservative(other_payload, model=self.model)
+            total = msg_tokens + tools_tokens + other_tokens + max_output
+            if total <= effective_budget:
+                break
+            if ts.get("auto_prune_context", True):
+                pruned = True
+                messages = messages[1:]
+                continue
+            break
+        msg_tokens = _estimate_tokens_conservative(messages, model=self.model)
+        tools_tokens = _estimate_tokens_conservative(tools, model=self.model) if tools else 0
+        other_tokens = _estimate_tokens_conservative(
+            {"tool_choice": kwargs.get("tool_choice"), "response_format": kwargs.get("response_format"), "extra_body": kwargs.get("extra_body"), "model": kwargs.get("model")},
+            model=self.model,
+        )
+        total = msg_tokens + tools_tokens + other_tokens + max_output
+        if total > effective_budget and ts.get("auto_reduce_output_tokens", True):
+            max_output = max(1, max_output - (total - effective_budget))
+            total = msg_tokens + tools_tokens + other_tokens + max_output
+        if total > effective_budget and ts.get("block_oversized_requests", True):
+            blocked = True
+            logger.error(
+                "[token-budget] configured_budget=%d safety_margin=%d effective_budget=%d messages_tokens=%d tools_tokens=%d other_tokens=%d output=%d total=%d ok=False final_max_tokens=%d pruned=%s blocked=%s",
+                configured_budget, safety_margin, effective_budget, msg_tokens, tools_tokens, other_tokens, max_output, total, max_output, pruned, blocked
+            )
+            raise TokenBudgetExceededError(f"Request blocked locally before provider call. total={total}, budget={effective_budget}")
+        logger.info(
+            "[token-budget] configured_budget=%d safety_margin=%d effective_budget=%d messages_tokens=%d tools_tokens=%d other_tokens=%d output=%d total=%d ok=%s final_max_tokens=%d pruned=%s blocked=%s",
+            configured_budget, safety_margin, effective_budget, msg_tokens, tools_tokens, other_tokens, max_output, total, total <= effective_budget, max_output, pruned, blocked
+        )
+        kwargs["messages"] = messages
+        kwargs["max_tokens"] = max_output
+        return kwargs
 
     def _is_anthropic_model(self) -> bool:
         """Return True when the configured model targets Anthropic."""
@@ -2419,6 +2496,7 @@ class LiteLLMProvider(LLMProvider):
             stream_finish_reason: str | None = None
 
             try:
+                kwargs = self._enforce_final_token_budget(kwargs)
                 response = await litellm.acompletion(**kwargs)  # type: ignore[union-attr]
 
                 async for chunk in response:
@@ -2741,7 +2819,12 @@ class LiteLLMProvider(LLMProvider):
                     continue
                 yield StreamErrorEvent(error=str(e), recoverable=False)
                 return
+            except Exception as e:
+                if _is_provider_request_too_large_error(e):
+                    yield StreamErrorEvent(error=str(ProviderRequestTooLargeError(str(e))), recoverable=False)
+                    return
 
+                # fallthrough disabled for provider-size errors
             except Exception as e:
                 # Some providers return non-standard finish_reason values
                 # (e.g., kimi-k2.5 sends 'pause_turn') that LiteLLM's
@@ -2869,3 +2952,23 @@ class LiteLLMProvider(LLMProvider):
             stop_reason=stop_reason,
             raw_response={"tool_calls": tool_calls} if tool_calls else None,
         )
+class TokenBudgetExceededError(ValueError):
+    """Raised when a request exceeds local token budget after pruning/reduction."""
+
+
+class ProviderRequestTooLargeError(RuntimeError):
+    """Raised when provider rejects request size (deterministic non-retryable)."""
+
+
+def _estimate_tokens_conservative(value: Any, model: str = "") -> int:
+    """Conservative token estimator preferring provider tokenizer."""
+    if litellm is not None:
+        try:
+            if isinstance(value, list) and value and isinstance(value[0], dict):
+                return int(litellm.token_counter(model=model or "", messages=value))
+            text = json.dumps(value, ensure_ascii=False, default=str)
+            return int(litellm.token_counter(model=model or "", text=text))
+        except Exception:
+            pass
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    return max(1, int(math.ceil(len(text) / 3.2)))

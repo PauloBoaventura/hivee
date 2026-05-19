@@ -93,6 +93,7 @@ from framework.config import get_vision_fallback_model
 from framework.host.event_bus import EventBus
 from framework.llm.capabilities import filter_tools_for_model, supports_image_tool_results
 from framework.llm.provider import Tool, ToolResult, ToolUse
+from framework.llm.litellm import ProviderRequestTooLargeError, TokenBudgetExceededError
 from framework.llm.stream_events import (
     FinishEvent,
     StreamErrorEvent,
@@ -1049,6 +1050,12 @@ class AgentLoop(AgentProtocol):
                     # still publishes a retry event so the UI can see us
                     # waiting (the "heartbeat" — no silent stalls).
                     self._bump("llm_turn_exception")
+                    deterministic_no_retry = isinstance(e, (TokenBudgetExceededError, ProviderRequestTooLargeError)) or any(
+                        marker in str(e).lower() for marker in ("api_key_invalid", "authenticationerror")
+                    )
+                    if deterministic_no_retry:
+                        logger.error("[%s] iter=%d: deterministic LLM error, no persistent retry: %s", node_id, iteration, str(e)[:200])
+                        raise
                     if self._is_capacity_error(e) and self._config.capacity_retry_max_seconds > 0:
                         self._bump("capacity_error")
                         now = time.monotonic()
