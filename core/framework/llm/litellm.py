@@ -940,31 +940,8 @@ def _extract_text_tool_calls(
 
 
 def _apply_token_budget(messages: list[dict[str, Any]], system: str, tools: list[Tool] | None, requested_max_tokens: int) -> tuple[list[dict[str, Any]], int, dict[str, Any]]:
-    from framework.config import get_token_settings
-
-    ts = get_token_settings()
-    budget = int(ts["token_budget_total"])
-    max_output = min(int(requested_max_tokens), int(ts["max_output_tokens"]), budget)
-    estimated_input, _ = _estimate_tokens("", messages)
-    total = estimated_input + max_output
-    pruned = False
-    blocked = False
-    if total > budget and ts.get("auto_prune_context", True):
-        pruned = True
-        while len(messages) > 2 and total > budget:
-            messages = messages[1:]
-            estimated_input, _ = _estimate_tokens("", messages)
-            total = estimated_input + max_output
-    if total > budget and ts.get("auto_reduce_output_tokens", True):
-        max_output = max(1, budget - estimated_input)
-        total = estimated_input + max_output
-    if total > budget and ts.get("block_oversized_requests", True):
-        blocked = True
-        raise TokenBudgetExceededError(
-            f"Request blocked locally: token budget exceeded. estimated_input_tokens={estimated_input}, max_output_tokens={max_output}, token_budget_total={budget}."
-        )
-    logger.info("[token-budget] estimated_input=%d output=%d total=%d budget=%d ok=%s final_max_tokens=%d pruned=%s blocked=%s", estimated_input, max_output, total, budget, total<=budget, max_output, pruned, blocked)
-    return messages, max_output, {"estimated_input_tokens": estimated_input, "token_budget_total": budget, "pruned": pruned}
+    """Legacy preflight checker retained for compatibility; final enforcement happens at provider-call boundary."""
+    return messages, requested_max_tokens, {}
 
 
 def _is_provider_request_too_large_error(exc: BaseException) -> bool:
@@ -1653,49 +1630,42 @@ class LiteLLMProvider(LLMProvider):
         effective_budget = max(1, configured_budget - safety_margin)
         messages = list(kwargs.get("messages") or [])
         tools = kwargs.get("tools") or []
+        model = str(kwargs.get("model") or self.model)
+        provider = model.split("/", 1)[0] if "/" in model else model
         max_output = min(int(kwargs.get("max_tokens", 1) or 1), int(ts["max_output_tokens"]), effective_budget)
         pruned = False
         blocked = False
-        while len(messages) > 2:
-            msg_tokens = _estimate_tokens_conservative(messages, model=self.model)
-            tools_tokens = _estimate_tokens_conservative(tools, model=self.model) if tools else 0
+
+        def _totals() -> tuple[int, int, int, int]:
+            estimated_message_tokens = _estimate_tokens_conservative(messages, model=model)
+            estimated_tools_tokens = _estimate_tokens_conservative(json.dumps(tools, ensure_ascii=False, default=str), model=model) if tools else 0
             other_payload = {
                 "tool_choice": kwargs.get("tool_choice"),
                 "response_format": kwargs.get("response_format"),
                 "extra_body": kwargs.get("extra_body"),
-                "provider": self.model.split("/", 1)[0] if "/" in self.model else self.model,
-                "model": kwargs.get("model"),
+                "model": model,
+                "provider": provider,
             }
-            other_tokens = _estimate_tokens_conservative(other_payload, model=self.model)
-            total = msg_tokens + tools_tokens + other_tokens + max_output
-            if total <= effective_budget:
-                break
-            if ts.get("auto_prune_context", True):
-                pruned = True
-                messages = messages[1:]
-                continue
-            break
-        msg_tokens = _estimate_tokens_conservative(messages, model=self.model)
-        tools_tokens = _estimate_tokens_conservative(tools, model=self.model) if tools else 0
-        other_tokens = _estimate_tokens_conservative(
-            {"tool_choice": kwargs.get("tool_choice"), "response_format": kwargs.get("response_format"), "extra_body": kwargs.get("extra_body"), "model": kwargs.get("model")},
-            model=self.model,
-        )
-        total = msg_tokens + tools_tokens + other_tokens + max_output
+            other_tokens = _estimate_tokens_conservative(other_payload, model=model)
+            total = estimated_message_tokens + estimated_tools_tokens + other_tokens + max_output
+            return estimated_message_tokens, estimated_tools_tokens, other_tokens, total
+
+        msg_tokens, tools_tokens, other_tokens, total = _totals()
+        while total > effective_budget and len(messages) > 2 and ts.get("auto_prune_context", True):
+            pruned = True
+            messages = messages[1:]
+            msg_tokens, tools_tokens, other_tokens, total = _totals()
+
         if total > effective_budget and ts.get("auto_reduce_output_tokens", True):
-            max_output = max(1, max_output - (total - effective_budget))
-            total = msg_tokens + tools_tokens + other_tokens + max_output
+            max_output = max(1, effective_budget - (msg_tokens + tools_tokens + other_tokens))
+            msg_tokens, tools_tokens, other_tokens, total = _totals()
+
         if total > effective_budget and ts.get("block_oversized_requests", True):
             blocked = True
-            logger.error(
-                "[token-budget] configured_budget=%d safety_margin=%d effective_budget=%d messages_tokens=%d tools_tokens=%d other_tokens=%d output=%d total=%d ok=False final_max_tokens=%d pruned=%s blocked=%s",
-                configured_budget, safety_margin, effective_budget, msg_tokens, tools_tokens, other_tokens, max_output, total, max_output, pruned, blocked
-            )
-            raise TokenBudgetExceededError(f"Request blocked locally before provider call. total={total}, budget={effective_budget}")
-        logger.info(
-            "[token-budget] configured_budget=%d safety_margin=%d effective_budget=%d messages_tokens=%d tools_tokens=%d other_tokens=%d output=%d total=%d ok=%s final_max_tokens=%d pruned=%s blocked=%s",
-            configured_budget, safety_margin, effective_budget, msg_tokens, tools_tokens, other_tokens, max_output, total, total <= effective_budget, max_output, pruned, blocked
-        )
+            logger.error("[token-budget] configured_budget=%d safety_margin=%d effective_budget=%d messages_tokens=%d tools_tokens=%d other_tokens=%d output=%d total=%d ok=False final_max_tokens=%d pruned=%s blocked=%s", configured_budget, safety_margin, effective_budget, msg_tokens, tools_tokens, other_tokens, max_output, total, max_output, pruned, blocked)
+            raise TokenBudgetExceededError(f"Request blocked locally before provider call. total={total}, budget={effective_budget}, configured_budget={configured_budget}")
+
+        logger.info("[token-budget] configured_budget=%d safety_margin=%d effective_budget=%d messages_tokens=%d tools_tokens=%d other_tokens=%d output=%d total=%d ok=%s final_max_tokens=%d pruned=%s blocked=%s", configured_budget, safety_margin, effective_budget, msg_tokens, tools_tokens, other_tokens, max_output, total, total <= effective_budget, max_output, pruned, blocked)
         kwargs["messages"] = messages
         kwargs["max_tokens"] = max_output
         return kwargs
