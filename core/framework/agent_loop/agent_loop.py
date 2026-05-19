@@ -1143,7 +1143,14 @@ class AgentLoop(AgentProtocol):
                     # for user input instead of killing the loop.  The user
                     # can retry or adjust the request.
                     if ctx.supports_direct_user_io:
-                        error_msg = f"LLM call failed: {e}"
+                        if isinstance(e, TokenBudgetExceededError):
+                            error_msg = (
+                                "Token budget exceeded. Current request requires more tokens than the configured "
+                                "budget. Increase Settings > System > Token > Token budget total or reduce "
+                                "context/tools/history."
+                            )
+                        else:
+                            error_msg = f"LLM call failed: {e}"
                         _guardrail_phrase = (
                             "no endpoints available matching your guardrail restrictions and data policy"
                         )
@@ -2639,7 +2646,12 @@ class AgentLoop(AgentProtocol):
 
                     elif isinstance(event, StreamErrorEvent):
                         if not event.recoverable:
-                            raise RuntimeError(f"Stream error: {event.error}")
+                            err_text = str(event.error)
+                            if "Token budget exceeded" in err_text:
+                                raise TokenBudgetExceededError(err_text)
+                            if any(m in err_text.lower() for m in ("invalid api key", "api key not valid", "api_key_invalid")):
+                                raise RuntimeError(f"AuthenticationError: {err_text}")
+                            raise RuntimeError(f"Stream error: {err_text}")
                         _stream_error = event
                         logger.warning("Recoverable stream error: %s", event.error)
 

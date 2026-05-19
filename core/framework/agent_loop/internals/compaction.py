@@ -321,6 +321,12 @@ async def compact(
         return
 
     # --- Step 4: Emergency deterministic summary (LLM failed/unavailable) ---
+    if conversation.usage_ratio() < 0.8:
+        logger.info(
+            "Skipping emergency compaction at low usage (%.0f%%)",
+            conversation.usage_ratio() * 100,
+        )
+        return
     logger.warning(
         "Emergency compaction (%.0f%% usage)",
         conversation.usage_ratio() * 100,
