@@ -50,7 +50,12 @@ interface ModelContextValue {
   availableModels: Record<string, ModelOption[]>;
 
   // Actions
-  setModel: (provider: string, model: string) => Promise<void>;
+  currentMaxTokens: number | null;
+  currentMaxContextTokens: number | null;
+  setModel: (provider: string, model: string, options?: {
+    max_tokens?: number;
+    max_context_tokens?: number;
+  }) => Promise<void>;
   activateSubscription: (subscriptionId: string) => Promise<void>;
   saveProviderKey: (providerId: string, apiKey: string) => Promise<void>;
   removeProviderKey: (providerId: string) => Promise<void>;
@@ -63,6 +68,8 @@ export function ModelProvider({ children }: { children: ReactNode }) {
   const [currentProvider, setCurrentProvider] = useState("");
   const [currentModel, setCurrentModel] = useState("");
   const [hasApiKey, setHasApiKey] = useState(false);
+  const [currentMaxTokens, setCurrentMaxTokens] = useState<number | null>(null);
+  const [currentMaxContextTokens, setCurrentMaxContextTokens] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [connectedProviders, setConnectedProviders] = useState<Set<string>>(new Set());
   const [availableModels, setAvailableModels] = useState<Record<string, ModelOption[]>>({});
@@ -81,6 +88,8 @@ export function ModelProvider({ children }: { children: ReactNode }) {
       setCurrentModel(llmConfig.model);
       setHasApiKey(llmConfig.has_api_key);
       setAvailableModels(modelsData.models);
+      setCurrentMaxTokens(llmConfig.max_tokens);
+      setCurrentMaxContextTokens(llmConfig.max_context_tokens);
 
       // Backend checks both env vars and credential store for all providers
       setConnectedProviders(new Set(llmConfig.connected_providers || []));
@@ -101,12 +110,21 @@ export function ModelProvider({ children }: { children: ReactNode }) {
   }, [refresh]);
 
   const setModel = useCallback(
-    async (provider: string, model: string) => {
-      const result = await configApi.setLLMConfig(provider, model);
+    async (
+      provider: string,
+      model: string,
+      options?: {
+        max_tokens?: number;
+        max_context_tokens?: number;
+      },
+    ) => {
+      const result = await configApi.setLLMConfig(provider, model, options);
       setCurrentProvider(result.provider);
       setCurrentModel(result.model);
       setHasApiKey(result.has_api_key);
       setActiveSubscription(result.active_subscription);
+      setCurrentMaxTokens(result.max_tokens);
+      setCurrentMaxContextTokens(result.max_context_tokens);
     },
     [],
   );
@@ -118,6 +136,8 @@ export function ModelProvider({ children }: { children: ReactNode }) {
       setCurrentModel(result.model);
       setHasApiKey(result.has_api_key);
       setActiveSubscription(result.active_subscription);
+      setCurrentMaxTokens(result.max_tokens);
+      setCurrentMaxContextTokens(result.max_context_tokens);
     },
     [],
   );
@@ -151,6 +171,8 @@ export function ModelProvider({ children }: { children: ReactNode }) {
         currentModel,
         hasApiKey,
         loading,
+        currentMaxTokens,
+        currentMaxContextTokens,
         connectedProviders,
         subscriptions,
         detectedSubscriptions,
