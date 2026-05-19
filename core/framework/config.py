@@ -47,6 +47,9 @@ def get_token_settings() -> dict[str, Any]:
         "include_history_in_budget": bool(cfg.get("include_history_in_budget", True)),
         "include_system_prompt_in_budget": bool(cfg.get("include_system_prompt_in_budget", True)),
         "rate_limit_max_retries": _clamp_int(cfg.get("rate_limit_max_retries"), 1, 0, 2),
+        "max_tools_per_request": _clamp_int(cfg.get("max_tools_per_request"), 8, 1, 64),
+        "tool_schema_budget_tokens": _clamp_int(cfg.get("tool_schema_budget_tokens"), 600, 64, 4000),
+        "auto_trim_tools": bool(cfg.get("auto_trim_tools", True)),
     }
 
 
