@@ -163,6 +163,18 @@ async def handle_save_credential(request: web.Request) -> web.Response:
     if not credential_id or not keys or not isinstance(keys, dict):
         return web.json_response({"error": "credential_id and keys are required"}, status=400)
 
+    if credential_id in ("groq", "gemini"):
+        cleaned: dict[str, str] = {}
+        for key_name, raw_value in keys.items():
+            if key_name != "api_key" and not key_name.startswith("api_key_"):
+                continue
+            value = str(raw_value).strip()
+            if value:
+                cleaned[key_name] = value
+        if not cleaned:
+            return web.json_response({"error": "At least one api_key is required"}, status=400)
+        keys = cleaned
+
     # ADEN_API_KEY is stored in the encrypted store via key_storage module
     if credential_id == "aden_api_key":
         key = keys.get("api_key", "").strip()
@@ -197,7 +209,7 @@ async def handle_save_credential(request: web.Request) -> web.Response:
     store = _get_store(request)
     cred = CredentialObject(
         id=credential_id,
-        keys={k: CredentialKey(name=k, value=SecretStr(v)) for k, v in keys.items()},
+        keys={k: CredentialKey(name=k, value=SecretStr(str(v).strip())) for k, v in keys.items() if str(v).strip()},
     )
     store.save_credential(cred)
     _invalidate_queen_credentials_cache(request)
