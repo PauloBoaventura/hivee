@@ -110,7 +110,14 @@ export function ModelProvider({ children }: { children: ReactNode }) {
   }, [refresh]);
 
   const setModel = useCallback(
-    async (provider: string, model: string, options) => {
+    async (
+      provider: string,
+      model: string,
+      options?: {
+        max_tokens?: number;
+        max_context_tokens?: number;
+      },
+    ) => {
       const result = await configApi.setLLMConfig(provider, model, options);
       setCurrentProvider(result.provider);
       setCurrentModel(result.model);
