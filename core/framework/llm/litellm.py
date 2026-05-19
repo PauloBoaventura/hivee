@@ -1651,6 +1651,22 @@ class LiteLLMProvider(LLMProvider):
             return estimated_message_tokens, estimated_tools_tokens, other_tokens, total
 
         msg_tokens, tools_tokens, other_tokens, total = _totals()
+        if (msg_tokens + tools_tokens + other_tokens + 1) > effective_budget:
+            logger.error(
+                "[token-budget] blocked request: messages_tokens=%d tools_tokens=%d other_tokens=%d output=%d total=%d budget=%d",
+                msg_tokens,
+                tools_tokens,
+                other_tokens,
+                max_output,
+                total,
+                effective_budget,
+            )
+            raise TokenBudgetExceededError(
+                "Token budget exceeded: "
+                f"messages_tokens={msg_tokens}, tools_tokens={tools_tokens}, "
+                f"other_tokens={other_tokens}, max_output_tokens={max_output}, "
+                f"total={total}, budget={effective_budget}"
+            )
         while total > effective_budget and len(messages) > 2 and ts.get("auto_prune_context", True):
             pruned = True
             messages = messages[1:]
@@ -1662,8 +1678,21 @@ class LiteLLMProvider(LLMProvider):
 
         if total > effective_budget and ts.get("block_oversized_requests", True):
             blocked = True
-            logger.error("[token-budget] configured_budget=%d safety_margin=%d effective_budget=%d messages_tokens=%d tools_tokens=%d other_tokens=%d output=%d total=%d ok=False final_max_tokens=%d pruned=%s blocked=%s", configured_budget, safety_margin, effective_budget, msg_tokens, tools_tokens, other_tokens, max_output, total, max_output, pruned, blocked)
-            raise TokenBudgetExceededError(f"Request blocked locally before provider call. total={total}, budget={effective_budget}, configured_budget={configured_budget}")
+            logger.error(
+                "[token-budget] blocked request: messages_tokens=%d tools_tokens=%d other_tokens=%d output=%d total=%d budget=%d",
+                msg_tokens,
+                tools_tokens,
+                other_tokens,
+                max_output,
+                total,
+                effective_budget,
+            )
+            raise TokenBudgetExceededError(
+                "Token budget exceeded: "
+                f"messages_tokens={msg_tokens}, tools_tokens={tools_tokens}, "
+                f"other_tokens={other_tokens}, max_output_tokens={max_output}, "
+                f"total={total}, budget={effective_budget}"
+            )
 
         logger.info("[token-budget] configured_budget=%d safety_margin=%d effective_budget=%d messages_tokens=%d tools_tokens=%d other_tokens=%d output=%d total=%d ok=%s final_max_tokens=%d pruned=%s blocked=%s", configured_budget, safety_margin, effective_budget, msg_tokens, tools_tokens, other_tokens, max_output, total, total <= effective_budget, max_output, pruned, blocked)
         kwargs["messages"] = messages
@@ -2922,7 +2951,7 @@ class LiteLLMProvider(LLMProvider):
             stop_reason=stop_reason,
             raw_response={"tool_calls": tool_calls} if tool_calls else None,
         )
-class TokenBudgetExceededError(ValueError):
+class TokenBudgetExceededError(RuntimeError):
     """Raised when a request exceeds local token budget after pruning/reduction."""
 
 
