@@ -178,6 +178,7 @@ class SessionManager:
         return LiteLLMProvider(
             model=rc.model,
             api_key=rc.api_key,
+            api_keys=rc.api_keys,
             api_base=rc.api_base,
             **rc.extra_kwargs,
         )

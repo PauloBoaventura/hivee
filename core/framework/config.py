@@ -118,6 +118,35 @@ def _get_api_key_from_credential_store(provider: str) -> str | None:
         return None
 
 
+def _get_api_keys_from_credential_store(provider: str) -> list[str] | None:
+    if not os.environ.get("HIVE_CREDENTIAL_KEY"):
+        return None
+    cred_id = _PROVIDER_CRED_MAP.get(provider.lower())
+    if not cred_id or cred_id not in ("groq", "gemini"):
+        return None
+    try:
+        from framework.credentials import CredentialStore
+
+        store = CredentialStore.with_encrypted_storage()
+        cred = store.get_credential(cred_id)
+        if not cred:
+            return None
+        keys: list[str] = []
+        for key_name, key_obj in cred.keys.items():
+            if key_name == "api_key" or key_name.startswith("api_key_"):
+                value = key_obj.get_secret_value().strip()
+                if value:
+                    keys.append(value)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for key in keys:
+            if key not in seen:
+                seen.add(key)
+                deduped.append(key)
+        return deduped or None
+    except Exception:
+        return None
+
 # ---------------------------------------------------------------------------
 # Derived helpers
 # ---------------------------------------------------------------------------
@@ -359,7 +388,13 @@ def get_api_keys() -> list[str] | None:
     llm = get_hive_config().get("llm", {})
     keys = llm.get("api_keys")
     if keys and isinstance(keys, list) and len(keys) > 0:
-        return [k for k in keys if k]  # filter empties
+        clean = [k.strip() for k in keys if isinstance(k, str) and k.strip()]
+        if clean:
+            return clean
+    provider = str(llm.get("provider", ""))
+    store_keys = _get_api_keys_from_credential_store(provider)
+    if store_keys:
+        return store_keys
     return None
 
 
@@ -607,5 +642,6 @@ class RuntimeConfig:
     max_tokens: int = field(default_factory=get_max_tokens)
     max_context_tokens: int = field(default_factory=get_max_context_tokens)
     api_key: str | None = field(default_factory=get_api_key)
+    api_keys: list[str] | None = field(default_factory=get_api_keys)
     api_base: str | None = field(default_factory=get_api_base)
     extra_kwargs: dict[str, Any] = field(default_factory=get_llm_extra_kwargs)

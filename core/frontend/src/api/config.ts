@@ -22,6 +22,11 @@ export interface LLMConfig {
   subscriptions: SubscriptionInfo[];
 }
 
+export interface LLMConfigUpdateOptions {
+  max_tokens?: number;
+  max_context_tokens?: number;
+}
+
 export interface LLMConfigUpdateResponse {
   provider: string;
   model: string;
@@ -47,8 +52,8 @@ export interface ModelsCatalogue {
 export const configApi = {
   getLLMConfig: () => api.get<LLMConfig>("/config/llm"),
 
-  setLLMConfig: (provider: string, model: string) =>
-    api.put<LLMConfigUpdateResponse>("/config/llm", { provider, model }),
+  setLLMConfig: (provider: string, model: string, options?: LLMConfigUpdateOptions) =>
+    api.put<LLMConfigUpdateResponse>("/config/llm", { provider, model, ...(options || {}) }),
 
   activateSubscription: (subscriptionId: string) =>
     api.put<LLMConfigUpdateResponse>("/config/llm", { subscription: subscriptionId }),

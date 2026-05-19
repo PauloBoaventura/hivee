@@ -1105,6 +1105,8 @@ class LiteLLMProvider(LLMProvider):
         """
         model = kwargs.get("model", self.model)
         retries = max_retries if max_retries is not None else RATE_LIMIT_MAX_RETRIES
+        if self._key_pool:
+            retries = min(retries, self._key_pool.size + 1)
         for attempt in range(retries + 1):
             # Rotate key from pool when available.
             current_key: str | None = None
@@ -1195,7 +1197,8 @@ class LiteLLMProvider(LLMProvider):
             except RateLimitError as e:
                 # Key pool: mark the offending key and rotate immediately.
                 if self._key_pool and current_key:
-                    self._key_pool.mark_rate_limited(current_key, retry_after=60.0)
+                    retry_after = _compute_retry_delay(0, exception=e) + 60.0
+                    self._key_pool.mark_rate_limited(current_key, retry_after=retry_after)
                     # When we have other healthy keys, skip the sleep -- the
                     # next iteration will pick a different key automatically.
                     if attempt < retries:
@@ -1353,6 +1356,8 @@ class LiteLLMProvider(LLMProvider):
         """
         model = kwargs.get("model", self.model)
         retries = max_retries if max_retries is not None else RATE_LIMIT_MAX_RETRIES
+        if self._key_pool:
+            retries = min(retries, self._key_pool.size + 1)
         for attempt in range(retries + 1):
             # Rotate key from pool when available.
             current_key: str | None = None
@@ -1441,7 +1446,8 @@ class LiteLLMProvider(LLMProvider):
             except RateLimitError as e:
                 # Key pool: mark the offending key and rotate immediately.
                 if self._key_pool and current_key:
-                    self._key_pool.mark_rate_limited(current_key, retry_after=60.0)
+                    retry_after = _compute_retry_delay(0, exception=e) + 60.0
+                    self._key_pool.mark_rate_limited(current_key, retry_after=retry_after)
                     if attempt < retries:
                         logger.info(
                             "[async-retry] Key pool rotating away from ...%s on 429",

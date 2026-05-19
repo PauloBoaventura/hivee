@@ -154,6 +154,14 @@ def _find_model_info(provider: str, model_id: str) -> dict | None:
     return find_model(provider, model_id)
 
 
+def _safe_int(value: object, default: int, min_value: int, max_value: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        return default
+    return max(min_value, min(parsed, max_value))
+
+
 def _write_config_atomic(config: dict) -> None:
     """Write config to ~/.hive/configuration.json atomically."""
     HIVE_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -502,8 +510,12 @@ async def handle_update_llm_config(request: web.Request) -> web.Response:
                 status=400,
             )
 
-        max_tokens = model_info["max_tokens"]
-        max_context_tokens = model_info["max_context_tokens"]
+        requested_max_tokens = body.get("max_tokens")
+        requested_max_context_tokens = body.get("max_context_tokens")
+        catalog_max_tokens = int(model_info["max_tokens"])
+        catalog_max_context_tokens = int(model_info["max_context_tokens"])
+        max_tokens = _safe_int(requested_max_tokens, catalog_max_tokens, 256, catalog_max_tokens)
+        max_context_tokens = _safe_int(requested_max_context_tokens, catalog_max_context_tokens, 4096, catalog_max_context_tokens)
 
         # Determine env var and api_base
         env_var = PROVIDER_ENV_VARS.get(provider.lower(), "")
