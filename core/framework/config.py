@@ -13,6 +13,42 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_MAX_TOKENS = 8192
+DEFAULT_TOKEN_BUDGET_TOTAL = 2024
+MIN_TOKEN_BUDGET_TOTAL = 512
+MAX_TOKEN_BUDGET_TOTAL = 7192
+DEFAULT_MAX_OUTPUT_TOKENS = 512
+DEFAULT_RESERVED_RESPONSE_TOKENS = 512
+
+
+def _clamp_int(value: Any, default: int, min_value: int, max_value: int) -> int:
+    try:
+        ivalue = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(min_value, min(ivalue, max_value))
+
+
+def get_token_settings() -> dict[str, Any]:
+    cfg = get_hive_config().get("token_settings", {})
+    budget = _clamp_int(cfg.get("token_budget_total"), DEFAULT_TOKEN_BUDGET_TOTAL, MIN_TOKEN_BUDGET_TOTAL, MAX_TOKEN_BUDGET_TOTAL)
+    reserved = _clamp_int(cfg.get("reserved_response_tokens"), DEFAULT_RESERVED_RESPONSE_TOKENS, 1, budget - 1)
+    max_output = _clamp_int(cfg.get("max_output_tokens"), DEFAULT_MAX_OUTPUT_TOKENS, 1, budget)
+    max_input = max(1, budget - reserved)
+    return {
+        "token_budget_total": budget,
+        "max_output_tokens": max_output,
+        "reserved_response_tokens": reserved,
+        "max_input_tokens": max_input,
+        "token_estimation_enabled": bool(cfg.get("token_estimation_enabled", True)),
+        "auto_reduce_output_tokens": bool(cfg.get("auto_reduce_output_tokens", True)),
+        "auto_prune_context": bool(cfg.get("auto_prune_context", True)),
+        "block_oversized_requests": bool(cfg.get("block_oversized_requests", True)),
+        "include_tools_in_budget": bool(cfg.get("include_tools_in_budget", True)),
+        "include_history_in_budget": bool(cfg.get("include_history_in_budget", True)),
+        "include_system_prompt_in_budget": bool(cfg.get("include_system_prompt_in_budget", True)),
+        "rate_limit_max_retries": _clamp_int(cfg.get("rate_limit_max_retries"), 1, 0, 2),
+    }
+
 
 # ---------------------------------------------------------------------------
 # Hive home directory structure
@@ -366,7 +402,7 @@ def get_worker_max_context_tokens() -> int:
 
 def get_max_tokens() -> int:
     """Return the configured max_tokens, falling back to DEFAULT_MAX_TOKENS."""
-    return get_hive_config().get("llm", {}).get("max_tokens", DEFAULT_MAX_TOKENS)
+    return get_token_settings()["max_output_tokens"]
 
 
 DEFAULT_MAX_CONTEXT_TOKENS = 32_000
