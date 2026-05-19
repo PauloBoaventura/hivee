@@ -9,6 +9,7 @@ import { compressImage } from "@/lib/image-utils";
 import McpServersPanel from "./McpServersPanel";
 
 const MULTI_KEY_PROVIDERS = new Set(["groq", "gemini"]);
+const TOKEN_PRESETS = [512, 768, 1024, 1536, 2048, 4096];
 
 interface SettingsModalProps {
   open: boolean;
@@ -34,6 +35,7 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
   const { theme, setTheme } = useTheme();
   const {
     currentProvider, currentModel, connectedProviders, availableModels,
+    currentMaxTokens, currentMaxContextTokens,
     setModel, saveProviderKey, subscriptions, detectedSubscriptions,
     activeSubscription, activateSubscription, refresh,
   } = useModel();
@@ -47,6 +49,8 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
     groq: [""],
     gemini: [""],
   });
+  const [customMaxTokens, setCustomMaxTokens] = useState<number>(1024);
+  const [customMaxContextTokens, setCustomMaxContextTokens] = useState<number>(24000);
   const [showKey, setShowKey] = useState(false);
   const [saving, setSaving] = useState(false);
   const [validation, setValidation] = useState<Record<string, "validating" | { valid: boolean | null; message: string }>>({});
@@ -75,6 +79,16 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
       if (initialSection) setActiveSection(initialSection);
     }
   }, [open, userProfile, initialSection]);
+
+  useEffect(() => {
+    if (!open) return;
+    if (typeof currentMaxTokens === "number" && currentMaxTokens > 0) {
+      setCustomMaxTokens(currentMaxTokens);
+    }
+    if (typeof currentMaxContextTokens === "number" && currentMaxContextTokens > 0) {
+      setCustomMaxContextTokens(currentMaxContextTokens);
+    }
+  }, [open, currentMaxTokens, currentMaxContextTokens]);
 
   if (!open) return null;
 
@@ -171,7 +185,85 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
   };
 
   const handleSelectModel = async (provider: string, modelId: string) => {
-    try { await setModel(provider, modelId); setModelDropdownOpen(false); } catch {}
+    const modelInfo = (availableModels[provider] || []).find((m) => m.id === modelId);
+    const maxModelTokens = modelInfo?.max_tokens ?? selectedModelMaxTokens;
+    const maxModelContextTokens = modelInfo?.max_context_tokens ?? selectedModelMaxContextTokens;
+    const nextMaxTokens = clampNumber(customMaxTokens, 256, maxModelTokens);
+    const nextMaxContextTokens = clampNumber(customMaxContextTokens, 4096, maxModelContextTokens);
+    try {
+      await setModel(provider, modelId, {
+        max_tokens: nextMaxTokens,
+        max_context_tokens: nextMaxContextTokens,
+      });
+      setCustomMaxTokens(nextMaxTokens);
+      setCustomMaxContextTokens(nextMaxContextTokens);
+      setModelDropdownOpen(false);
+    } catch {}
+  };
+
+  const handleSaveMultiKeys = async (providerId: string) => {
+    const keys = (multiKeyInputs[providerId] ?? [""])
+      .map((key) => key.trim())
+      .filter(Boolean)
+      .filter((key, index, list) => list.indexOf(key) === index);
+    if (!keys.length) return;
+
+    setSaving(true);
+    setValidation((v) => ({ ...v, [providerId]: "validating" }));
+
+    const primaryValidation = await credentialsApi
+      .validateKey(providerId, keys[0])
+      .catch(() => ({
+        valid: null as boolean | null,
+        message: "Could not verify key",
+      }));
+
+    if (primaryValidation.valid === false) {
+      setSaving(false);
+      setValidation((v) => ({
+        ...v,
+        [providerId]: {
+          valid: false,
+          message: primaryValidation.message,
+        },
+      }));
+      clearValidation(providerId);
+      return;
+    }
+
+    const payload = Object.fromEntries(
+      keys.map((key, index) => [
+        index === 0 ? "api_key" : `api_key_${index + 1}`,
+        key,
+      ]),
+    );
+
+    try {
+      await credentialsApi.save(providerId, payload);
+      setEditingProvider(null);
+      setMultiKeyInputs((prev) => ({ ...prev, [providerId]: [""] }));
+      setShowKey(false);
+      setValidation((v) => ({
+        ...v,
+        [providerId]: {
+          valid: primaryValidation.valid,
+          message: primaryValidation.message,
+        },
+      }));
+      await refresh();
+      clearValidation(providerId);
+    } catch {
+      setValidation((v) => ({
+        ...v,
+        [providerId]: {
+          valid: false,
+          message: "Failed to save keys",
+        },
+      }));
+      clearValidation(providerId);
+    } finally {
+      setSaving(false);
+    }
   };
 
   const handleSaveMultiKeys = async (providerId: string) => {
@@ -243,10 +335,17 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
     try { await activateSubscription(subId); } catch {}
   };
 
+  const clampNumber = (value: number, min: number, max: number) =>
+    Math.min(Math.max(value, min), max);
+
   const initials = displayName.trim().split(/\s+/).map((w) => w[0]).join("").toUpperCase().slice(0, 2);
 
   const activeSubInfo = activeSubscription ? subscriptions.find((s) => s.id === activeSubscription) : null;
   const providerForModels = activeSubInfo?.provider || currentProvider;
+  const selectedModelInfo =
+    (availableModels[providerForModels] || []).find((m) => m.id === currentModel) || null;
+  const selectedModelMaxTokens = selectedModelInfo?.max_tokens ?? 4096;
+  const selectedModelMaxContextTokens = selectedModelInfo?.max_context_tokens ?? 32000;
   const modelsForLabel = availableModels[providerForModels] || [];
   const currentModelLabel = modelsForLabel.find((m) => m.id === currentModel)?.label || currentModel || "Not configured";
 
@@ -281,6 +380,23 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
   const cancelEditing = () => {
     setEditingProvider(null);
     setKeyInput("");
+  };
+
+  const handleSaveTokenLimits = async () => {
+    if (!currentProvider || !currentModel) return;
+    const nextMaxTokens = clampNumber(customMaxTokens, 256, selectedModelMaxTokens);
+    const nextMaxContextTokens = clampNumber(customMaxContextTokens, 4096, selectedModelMaxContextTokens);
+    setSaving(true);
+    try {
+      await setModel(currentProvider, currentModel, {
+        max_tokens: nextMaxTokens,
+        max_context_tokens: nextMaxContextTokens,
+      });
+      setCustomMaxTokens(nextMaxTokens);
+      setCustomMaxContextTokens(nextMaxContextTokens);
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -443,6 +559,72 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
                         ))}
                       </div>
                     )}
+                  </div>
+                </div>
+
+                {/* Token Limits */}
+                <div>
+                  <p className="text-[11px] font-semibold text-muted-foreground/60 uppercase tracking-wider mb-3">
+                    Token limits
+                  </p>
+                  <div className="rounded-lg border border-border/50 bg-muted/20 p-3 flex flex-col gap-3">
+                    <div>
+                      <label className="text-xs font-medium text-foreground mb-1.5 block">max_tokens</label>
+                      <div className="flex flex-wrap gap-1.5 mb-2">
+                        {TOKEN_PRESETS.map((preset) => {
+                          const disabled = preset > selectedModelMaxTokens;
+                          const active = customMaxTokens === preset;
+                          return (
+                            <button
+                              key={preset}
+                              type="button"
+                              disabled={disabled}
+                              onClick={() => setCustomMaxTokens(clampNumber(preset, 256, selectedModelMaxTokens))}
+                              className={`px-2.5 py-1 rounded-md text-xs font-medium border ${active ? "bg-primary/15 text-primary border-primary/30" : "bg-background/40 text-muted-foreground border-border/50 hover:text-foreground hover:bg-muted/30"} disabled:opacity-40 disabled:cursor-not-allowed`}
+                            >
+                              {preset}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <input
+                        type="number"
+                        min={256}
+                        max={selectedModelMaxTokens}
+                        value={customMaxTokens}
+                        onChange={(e) => setCustomMaxTokens(clampNumber(Number(e.target.value || 0), 256, selectedModelMaxTokens))}
+                        className="w-full bg-muted/30 border border-border/50 rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
+                      />
+                      <p className="text-[11px] text-muted-foreground mt-1">
+                        Model maximum: {selectedModelMaxTokens}. Lower values reduce output size and help avoid 429.
+                      </p>
+                    </div>
+
+                    <div>
+                      <label className="text-xs font-medium text-foreground mb-1.5 block">max_context_tokens</label>
+                      <input
+                        type="number"
+                        min={4096}
+                        max={selectedModelMaxContextTokens}
+                        value={customMaxContextTokens}
+                        onChange={(e) => setCustomMaxContextTokens(clampNumber(Number(e.target.value || 0), 4096, selectedModelMaxContextTokens))}
+                        className="w-full bg-muted/30 border border-border/50 rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
+                      />
+                      <p className="text-[11px] text-muted-foreground mt-1">
+                        Model context maximum: {selectedModelMaxContextTokens}. Lower values reduce large prompts and tool history.
+                      </p>
+                    </div>
+
+                    <div className="flex justify-end">
+                      <button
+                        type="button"
+                        onClick={handleSaveTokenLimits}
+                        disabled={saving || !currentProvider || !currentModel}
+                        className="px-3 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-semibold hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {saving ? "Saving..." : "Save token limits"}
+                      </button>
+                    </div>
                   </div>
                 </div>
 
